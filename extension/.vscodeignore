@@ -1,0 +1,17 @@
+.git/**
+.github/**
+.vscode/**
+node_modules/**
+**/*.map
+**/*.pyc
+**/__pycache__/**
+**/.DS_Store
+*.log
+scratch/**
+tests/**
+logo.png
+*.sqlite*
+*.tmp*
+package_extension.sh
+publish_extension.sh
+PUBLISHING_GUIDE.md

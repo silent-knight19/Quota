@@ -1,0 +1,11 @@
+.git/**
+.github/**
+.vscode/**
+node_modules/**
+**/*.map
+**/*.pyc
+**/__pycache__/**
+**/.DS_Store
+*.log
+scratch/**
+tests/**

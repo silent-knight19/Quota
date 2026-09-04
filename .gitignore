@@ -1,0 +1,96 @@
+# ==============================================================================
+# QUOTA — SENSITIVE USER DATA & TELEMETRY (NEVER COMMIT)
+# ==============================================================================
+# Persistent SQLite database & transaction journals
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+persistent_ledger.sqlite*
+
+# Local personal JSON ledgers & token telemetry snapshots
+persistent_ledger.json
+token_data.json
+budget_config.json
+*.jsonl
+
+# Exported spreadsheets & user reports
+*.csv
+quota_token_ledger_*.csv
+antigravity_token_ledger_*.csv
+
+# ==============================================================================
+# BUILD ARTIFACTS & PACKAGES
+# ==============================================================================
+*.vsix
+*.tar.gz
+*.zip
+dist/
+build/
+out/
+
+# ==============================================================================
+# PYTHON & ENVIRONMENT
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# ==============================================================================
+# NODE & JAVASCRIPT
+# ==============================================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ==============================================================================
+# CREDENTIALS & SECRETS
+# ==============================================================================
+.env
+.env.*
+*.pem
+*.key
+*.pat
+*.secret
+credentials.json
+
+# ==============================================================================
+# LOGS & TEMPORARY FILES
+# ==============================================================================
+*.log
+*.tmp
+*.tmp.*
+scratch/
+test_*.js
+test_*.py
+
+# ==============================================================================
+# OPERATING SYSTEM & IDE METADATA
+# ==============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE workspace caches
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
