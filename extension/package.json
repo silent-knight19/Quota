@@ -1,118 +1,118 @@
 {
-	"name": "quota",
-	"displayName": "Quota — AI Token & Commercial Cost Intelligence",
-	"description": "Real-time AI token and commercial cost observability for Google Antigravity IDE and VS Code",
-	"version": "1.2.0",
-	"publisher": "silent-knight19",
-	"license": "MIT",
-	"pricing": "Free",
-	"repository": {
-		"type": "git",
-		"url": "https://github.com/silent-knight19/quota"
-	},
-	"bugs": {
-		"url": "https://github.com/silent-knight19/quota/issues"
-	},
-	"homepage": "https://github.com/silent-knight19/quota#readme",
-	"qna": "marketplace",
-	"galleryBanner": {
-		"color": "#09090b",
-		"theme": "dark"
-	},
-	"badges": [
-		{
-			"url": "https://img.shields.io/badge/Privacy-100%25%20Local-green.svg",
-			"href": "https://github.com/silent-knight19/quota#privacy",
-			"description": "100% Local Privacy"
-		},
-		{
-			"url": "https://img.shields.io/badge/License-MIT-blue.svg",
-			"href": "https://github.com/silent-knight19/quota/blob/main/LICENSE",
-			"description": "MIT License"
-		}
-	],
-	"engines": {
-		"vscode": "^1.75.0"
-	},
-	"categories": [
-		"AI",
-		"Productivity",
-		"Other"
-	],
-	"keywords": [
-		"ai",
-		"tokens",
-		"token-tracker",
-		"antigravity",
-		"gemini",
-		"claude",
-		"cost",
-		"observability",
-		"llm",
-		"spending"
-	],
-	"activationEvents": [
-		"onStartupFinished"
-	],
-	"main": "./extension.js",
-	"contributes": {
-		"commands": [
-			{
-				"command": "antigravity-tracker.quickMenu",
-				"title": "Open Quota Quick Actions",
-				"category": "Quota"
-			},
-			{
-				"command": "antigravity-tracker.openDashboard",
-				"title": "Open Quota Dashboard",
-				"category": "Quota"
-			},
-			{
-				"command": "antigravity-tracker.refresh",
-				"title": "Refresh Quota Data",
-				"category": "Quota"
-			},
-			{
-				"command": "antigravity-tracker.showQuickSummary",
-				"title": "Show Quota Summary",
-				"category": "Quota"
-			}
-		],
-		"configuration": {
-			"title": "Quota",
-			"properties": {
-				"quota.pythonPath": {
-					"type": "string",
-					"default": "",
-					"description": "Custom path to Python 3 binary (leave empty to use system default python3/python)"
-				},
-				"quota.statusBarMode": {
-					"type": "string",
-					"default": "session",
-					"enum": [
-						"session",
-						"workspace",
-						"total"
-					],
-					"enumDescriptions": [
-						"Show active chat session token and cost metrics",
-						"Show current workspace repository metrics",
-						"Show lifetime cumulative global metrics"
-					],
-					"description": "Metric scope displayed in the IDE bottom status bar"
-				},
-				"quota.dataDirectory": {
-					"type": "string",
-					"default": "",
-					"description": "Custom directory path for persistent SQLite ledger (leave empty for ~/.config/quota)"
-				}
-			}
-		}
-	},
-	"icon": "icon.png",
-	"__metadata": {
-		"installedTimestamp": 1788504700638,
-		"targetPlatform": "undefined",
-		"size": 554637
-	}
+  "name": "quota",
+  "displayName": "Quota \u2014 AI Token & Commercial Cost Intelligence",
+  "description": "Real-time AI token and commercial cost observability for Google Antigravity IDE and VS Code",
+  "version": "1.2.0",
+  "publisher": "SachinSingh",
+  "license": "MIT",
+  "pricing": "Free",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/silent-knight19/quota"
+  },
+  "bugs": {
+    "url": "https://github.com/silent-knight19/quota/issues"
+  },
+  "homepage": "https://github.com/silent-knight19/quota#readme",
+  "qna": "marketplace",
+  "galleryBanner": {
+    "color": "#09090b",
+    "theme": "dark"
+  },
+  "badges": [
+    {
+      "url": "https://img.shields.io/badge/Privacy-100%25%20Local-green.svg",
+      "href": "https://github.com/silent-knight19/quota#privacy",
+      "description": "100% Local Privacy"
+    },
+    {
+      "url": "https://img.shields.io/badge/License-MIT-blue.svg",
+      "href": "https://github.com/silent-knight19/quota/blob/main/LICENSE",
+      "description": "MIT License"
+    }
+  ],
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "AI",
+    "Productivity",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "tokens",
+    "token-tracker",
+    "antigravity",
+    "gemini",
+    "claude",
+    "cost",
+    "observability",
+    "llm",
+    "spending"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "antigravity-tracker.quickMenu",
+        "title": "Open Quota Quick Actions",
+        "category": "Quota"
+      },
+      {
+        "command": "antigravity-tracker.openDashboard",
+        "title": "Open Quota Dashboard",
+        "category": "Quota"
+      },
+      {
+        "command": "antigravity-tracker.refresh",
+        "title": "Refresh Quota Data",
+        "category": "Quota"
+      },
+      {
+        "command": "antigravity-tracker.showQuickSummary",
+        "title": "Show Quota Summary",
+        "category": "Quota"
+      }
+    ],
+    "configuration": {
+      "title": "Quota",
+      "properties": {
+        "quota.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom path to Python 3 binary (leave empty to use system default python3/python)"
+        },
+        "quota.statusBarMode": {
+          "type": "string",
+          "default": "session",
+          "enum": [
+            "session",
+            "workspace",
+            "total"
+          ],
+          "enumDescriptions": [
+            "Show active chat session token and cost metrics",
+            "Show current workspace repository metrics",
+            "Show lifetime cumulative global metrics"
+          ],
+          "description": "Metric scope displayed in the IDE bottom status bar"
+        },
+        "quota.dataDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Custom directory path for persistent SQLite ledger (leave empty for ~/.config/quota)"
+        }
+      }
+    }
+  },
+  "icon": "icon.png",
+  "__metadata": {
+    "installedTimestamp": 1788504700638,
+    "targetPlatform": "undefined",
+    "size": 554637
+  }
 }
