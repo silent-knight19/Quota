@@ -1,5 +1,5 @@
 {
-  "name": "quota",
+  "name": "quota-tracker",
   "displayName": "Quota \u2014 AI Token & Commercial Cost Intelligence",
   "description": "Real-time AI token and commercial cost observability for Google Antigravity IDE and VS Code",
   "version": "1.2.0",

@@ -3,7 +3,7 @@
 set -e
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/extension" && pwd)"
-EXT_NAME="SachinSingh.quota-1.2.0"
+EXT_NAME="SachinSingh.quota-tracker-1.2.0"
 LEGACY_EXT="antigravity.antigravity-token-tracker-1.0.0"
 
 echo "📦 Installing & Linking Quota VS Code Extension..."
