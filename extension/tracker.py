@@ -11,6 +11,8 @@ import json
 import re
 import csv
 import io
+import math
+import calendar
 import sqlite3
 import shutil
 import argparse
@@ -18,15 +20,45 @@ from datetime import datetime
 from collections import defaultdict
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DATA_DIR = os.environ.get("QUOTA_DATA_DIR") or os.path.expanduser("~/.config/quota")
+if sys.platform == "win32":
+    default_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "quota")
+else:
+    default_dir = os.path.expanduser("~/.config/quota")
+DEFAULT_DATA_DIR = os.environ.get("QUOTA_DATA_DIR") or default_dir
 DATA_DIR = DEFAULT_DATA_DIR
 BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity-ide/brain")
 DB_PATH = os.path.join(DATA_DIR, "persistent_ledger.sqlite")
 LEDGER_JSON = os.path.join(DATA_DIR, "persistent_ledger.json")
 TOKEN_DATA_JSON = os.path.join(DATA_DIR, "token_data.json")
-BACKUP_DIR_LOCAL = os.path.expanduser("~/.config/quota/backups")
+BACKUP_DIR_LOCAL = os.path.join(DATA_DIR, "backups")
 BUDGET_FILE = os.path.join(DATA_DIR, "budget_config.json")
 ICLOUD_BACKUP_DIR = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/AntigravityTokenBackups")
+
+def atomic_write_json(target_path: str, data, mode=0o600):
+    """Write JSON atomically using PID-specific temp file and os.replace()."""
+    target = os.path.abspath(target_path)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp = f"{target}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(tmp, mode)
+    except OSError:
+        pass
+    os.replace(tmp, target)
+
+def safe_csv_cell(value):
+    """Neutralize spreadsheet formula injection characters (=, +, -, @, \\t, \\r)."""
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    text = str(value)
+    if text.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + text
+    return text
 
 def set_active_data_dir(custom_dir):
     global DATA_DIR, DB_PATH, LEDGER_JSON, TOKEN_DATA_JSON, BACKUP_DIR_LOCAL, BUDGET_FILE
@@ -132,26 +164,26 @@ PRICING_TABLE = {
         "output": 60.00,
         "thinking": 60.00,
     },
-    "Claude Opus 4.6 (Thinking)": {
-        "family": "Anthropic",
-        "input_uncached": 15.00,
-        "input_cached_read": 1.50,
-        "output": 75.00,
-        "thinking": 75.00,
-    },
-    "Claude Sonnet 4.6 (Thinking)": {
-        "family": "Anthropic",
+    "o1-mini": {
+        "family": "OpenAI",
         "input_uncached": 3.00,
-        "input_cached_read": 0.30,
-        "output": 15.00,
-        "thinking": 15.00,
+        "input_cached_read": 1.50,
+        "output": 12.00,
+        "thinking": 12.00,
     },
-    "Gemini 3.1 Pro (High)": {
-        "family": "Google",
-        "input_uncached": 1.25,
-        "input_cached_read": 0.3125,
-        "output": 5.00,
-        "thinking": 5.00,
+    "o3": {
+        "family": "OpenAI",
+        "input_uncached": 15.00,
+        "input_cached_read": 7.50,
+        "output": 60.00,
+        "thinking": 60.00,
+    },
+    "o3-mini": {
+        "family": "OpenAI",
+        "input_uncached": 1.10,
+        "input_cached_read": 0.55,
+        "output": 4.40,
+        "thinking": 4.40,
     },
     "Gemini 3.8 Flash (High)": {
         "family": "Google",
@@ -236,6 +268,12 @@ PRICING_TABLE = {
 CONTEXT_WINDOW_LIMITS = {
     "Claude": 200_000,
     "Gemini": 200_000,
+    "GPT-4o": 128_000,
+    "GPT-4": 128_000,
+    "o1": 200_000,
+    "o3": 200_000,
+    "o3-mini": 200_000,
+    "o1-mini": 128_000,
     "Default": 200_000,
 }
 
@@ -251,6 +289,36 @@ def estimate_tokens(text: str) -> int:
         return 0
     return max(1, int(len(text) / 3.8))
 
+def normalize_model_str(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+PRICING_ALIASES = {
+    "gpt 4o": "GPT-4o",
+    "gpt 4": "GPT-4o",
+    "gpt 4o mini": "GPT-4o-mini",
+    "o1": "o1",
+    "o1 mini": "o1-mini",
+    "o1 preview": "o1",
+    "o3": "o3",
+    "o3 mini": "o3-mini",
+    "claude 3 5 sonnet": "Claude 3.5 Sonnet",
+    "claude 3 7 sonnet": "Claude Sonnet 4.6 (Thinking)",
+    "claude 3 5 haiku": "Claude 3.5 Haiku",
+    "claude 3 opus": "Claude Opus 4.6 (Thinking)",
+    "claude opus 4 6": "Claude Opus 4.6 (Thinking)",
+    "claude sonnet 4 6": "Claude Sonnet 4.6 (Thinking)",
+    "gemini 1 5 pro": "Gemini 1.5 Pro",
+    "gemini 1 5 flash": "Gemini 1.5 Flash",
+    "gemini 2 0 flash": "Gemini 2.0 Flash",
+    "gemini 3 1 pro": "Gemini 3.1 Pro (High)",
+    "gemini 3 8 flash": "Gemini 3.8 Flash (High)",
+    "gemini 3 7 flash": "Gemini 3.7 Flash (High)",
+    "gemini 3 6 flash": "Gemini 3.6 Flash (High)",
+    "gemini 3 5 flash": "Gemini 3.5 Flash (High)",
+}
+
 def get_pricing(model_name: str) -> dict:
     if not model_name:
         return PRICING_TABLE["Default"]
@@ -262,30 +330,54 @@ def get_pricing(model_name: str) -> dict:
         if k.lower() == name_low:
             return v
 
+    norm = normalize_model_str(model_name)
     for k, v in PRICING_TABLE.items():
-        k_low = k.lower()
-        if k_low in name_low or name_low in k_low:
+        if normalize_model_str(k) == norm:
             return v
 
-    if "opus" in name_low:
-        return PRICING_TABLE["Claude Opus 4.6 (Thinking)"]
-    if "sonnet" in name_low:
-        return PRICING_TABLE["Claude Sonnet 4.6 (Thinking)"]
-    if "haiku" in name_low:
-        return PRICING_TABLE["Claude 3.5 Haiku"]
-    if "gpt-4o-mini" in name_low:
+    if norm in PRICING_ALIASES:
+        return PRICING_TABLE[PRICING_ALIASES[norm]]
+
+    # Specific sub-tier tokens checked FIRST to prevent parent shadowing
+    if "o1 mini" in norm or "o1-mini" in name_low:
+        return PRICING_TABLE["o1-mini"]
+    if "o3 mini" in norm or "o3-mini" in name_low:
+        return PRICING_TABLE["o3-mini"]
+    if "gpt 4o mini" in norm or "gpt-4o-mini" in name_low:
         return PRICING_TABLE["GPT-4o-mini"]
-    if "gpt-4o" in name_low or "gpt-4" in name_low:
-        return PRICING_TABLE["GPT-4o"]
-    if "o1" in name_low or "o3" in name_low:
-        return PRICING_TABLE["o1"]
-    if "pro" in name_low and ("gemini" in name_low or "google" in name_low):
-        return PRICING_TABLE["Gemini 3.1 Pro (High)"]
-    if "flash" in name_low:
+    if "haiku" in norm:
+        return PRICING_TABLE["Claude 3.5 Haiku"]
+    if "flash" in norm:
+        if "1 5" in norm:
+            return PRICING_TABLE["Gemini 1.5 Flash"]
+        if "2 0" in norm:
+            return PRICING_TABLE["Gemini 2.0 Flash"]
+        if "3 5" in norm:
+            return PRICING_TABLE["Gemini 3.5 Flash (High)"]
+        if "3 6" in norm:
+            return PRICING_TABLE["Gemini 3.6 Flash (High)"]
+        if "3 7" in norm:
+            return PRICING_TABLE["Gemini 3.7 Flash (High)"]
         return PRICING_TABLE["Gemini 3.8 Flash (High)"]
-    if "claude" in name_low:
+    if "opus" in norm:
+        return PRICING_TABLE["Claude Opus 4.6 (Thinking)"]
+    if "sonnet" in norm:
+        if "3 5" in norm:
+            return PRICING_TABLE["Claude 3.5 Sonnet"]
         return PRICING_TABLE["Claude Sonnet 4.6 (Thinking)"]
-    if "gemini" in name_low:
+    if "o1" in norm.split():
+        return PRICING_TABLE["o1"]
+    if "o3" in norm.split():
+        return PRICING_TABLE["o3"]
+    if "gpt 4o" in norm or "gpt 4" in norm:
+        return PRICING_TABLE["GPT-4o"]
+    if "pro" in norm and ("gemini" in norm or "google" in norm):
+        if "1 5" in norm:
+            return PRICING_TABLE["Gemini 1.5 Pro"]
+        return PRICING_TABLE["Gemini 3.1 Pro (High)"]
+    if "claude" in norm:
+        return PRICING_TABLE["Claude Sonnet 4.6 (Thinking)"]
+    if "gemini" in norm:
         return PRICING_TABLE["Gemini 3.8 Flash (High)"]
 
     return PRICING_TABLE["Default"]
@@ -293,16 +385,41 @@ def get_pricing(model_name: str) -> dict:
 def clean_project_name(path_or_str: str) -> str:
     if not path_or_str:
         return "General"
-    path_or_str = path_or_str.strip().rstrip('/')
-    parts = path_or_str.split('/')
-    home_user = os.path.basename(os.path.expanduser('~'))
-    ignored = {'.gemini', '.vscode', '.local', 'Library', 'Applications', 'Users', 'home', home_user, 'tempmediaStorage'}
-    filtered = [p for p in parts if p and p not in ignored]
+    raw = str(path_or_str).strip()
+    if "->" in raw:
+        raw = raw.split("->")[0].strip()
+    raw = raw.strip("[]'\" \t")
+    if raw.startswith("file://"):
+        raw = raw[7:]
+    raw = raw.rstrip("/\\").strip("[]'\" \t")
+    parts = [p.strip("[]'\" \t") for p in re.split(r"[\\/]", raw) if p]
+    home_user = os.path.basename(os.path.expanduser("~"))
+    ignored = {
+        ".gemini", ".vscode", ".local", "Library", "Applications",
+        "Users", "home", home_user, "tempmediaStorage",
+        "Projects", "Projectss", "Documents", "Desktop", "Downloads",
+        ".config", "AppData", "Local", "Roaming",
+        "src", "lib", "dist", "build", "tests", "test", "scripts", "node_modules"
+    }
+    # Any folder immediately following 'Users' or 'home' is a username folder
+    for i, p in enumerate(parts):
+        if i > 0 and parts[i - 1].lower() in ("users", "home"):
+            ignored.add(p)
+
+    filtered = []
+    for p in parts:
+        if re.match(r"^[A-Za-z]:$", p):
+            continue
+        if p in ignored:
+            continue
+        filtered.append(p)
     if not filtered:
         return "General"
-    if filtered[0] == 'Downloads' and len(filtered) > 1:
-        return filtered[1]
-    return filtered[0]
+
+    if len(filtered) > 1 and re.search(r"\.(md|py|js|ts|json|html|css|txt|csv|jsx|tsx|go|rs|c|cpp|h|rb|php|java)$", filtered[-1], re.IGNORECASE):
+        return filtered[-2]
+
+    return filtered[-1]
 
 def load_budget() -> dict:
     os.makedirs(BACKUP_DIR_LOCAL, exist_ok=True)
@@ -320,10 +437,15 @@ def load_budget() -> dict:
     return default_budget
 
 def save_budget(daily: float, monthly: float) -> dict:
+    d_val = float(daily)
+    m_val = float(monthly)
+    if not math.isfinite(d_val) or d_val < 0.10:
+        raise ValueError("Daily budget must be a positive finite number >= 0.10")
+    if not math.isfinite(m_val) or m_val < 1.00:
+        raise ValueError("Monthly budget must be a positive finite number >= 1.00")
     os.makedirs(BACKUP_DIR_LOCAL, exist_ok=True)
-    d = {"daily_usd": float(daily), "monthly_usd": float(monthly)}
-    with open(BUDGET_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f, indent=2)
+    d = {"daily_usd": round(d_val, 2), "monthly_usd": round(m_val, 2)}
+    atomic_write_json(BUDGET_FILE, d)
     return d
 
 def get_db_connection(db_path=None):
@@ -362,7 +484,9 @@ def init_database(db_path=None):
         is_active INTEGER DEFAULT 1,
         tools_json TEXT DEFAULT '{}',
         trace_json TEXT DEFAULT '[]',
-        anomaly_json TEXT DEFAULT '[]'
+        anomaly_json TEXT DEFAULT '[]',
+        daily_breakdown_json TEXT DEFAULT '{}',
+        first_date TEXT DEFAULT ''
     )''')
     
     # Check if extra columns exist (schema migration)
@@ -374,6 +498,10 @@ def init_database(db_path=None):
         cur.execute("ALTER TABLE conversations_ledger ADD COLUMN trace_json TEXT DEFAULT '[]'")
     if "anomaly_json" not in cols:
         cur.execute("ALTER TABLE conversations_ledger ADD COLUMN anomaly_json TEXT DEFAULT '[]'")
+    if "daily_breakdown_json" not in cols:
+        cur.execute("ALTER TABLE conversations_ledger ADD COLUMN daily_breakdown_json TEXT DEFAULT '{}'")
+    if "first_date" not in cols:
+        cur.execute("ALTER TABLE conversations_ledger ADD COLUMN first_date TEXT DEFAULT ''")
         
     cur.execute('''CREATE TABLE IF NOT EXISTS metadata (
         key TEXT PRIMARY KEY,
@@ -388,84 +516,99 @@ def load_ledger_from_db(db_path=None) -> dict:
         init_database(target_path)
     conn = get_db_connection(target_path)
     conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute('SELECT * FROM conversations_ledger')
-    rows = cur.fetchall()
-    
-    ledger = {}
-    for r in rows:
-        conv = dict(r)
-        try:
-            conv["models"] = json.loads(conv.get("models_json") or "[]")
-        except:
-            conv["models"] = [conv.get("primary_model")]
-        try:
-            conv["tools"] = json.loads(conv.get("tools_json") or "{}")
-        except:
-            conv["tools"] = {}
-        try:
-            conv["trace"] = json.loads(conv.get("trace_json") or "[]")
-        except:
-            conv["trace"] = []
-        try:
-            conv["anomalies"] = json.loads(conv.get("anomaly_json") or "[]")
-        except:
-            conv["anomalies"] = []
-            
-        conv["id"] = conv["conv_id"]
-        conv["short_id"] = conv["conv_id"][:8]
-        ledger[conv["conv_id"]] = conv
-    conn.close()
-    return ledger
+    try:
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM conversations_ledger')
+        rows = cur.fetchall()
+        
+        ledger = {}
+        for r in rows:
+            conv = dict(r)
+            try:
+                conv["models"] = json.loads(conv.get("models_json") or "[]")
+            except:
+                conv["models"] = [conv.get("primary_model")]
+            try:
+                conv["tools"] = json.loads(conv.get("tools_json") or "{}")
+            except:
+                conv["tools"] = {}
+            try:
+                conv["trace"] = json.loads(conv.get("trace_json") or "[]")
+            except:
+                conv["trace"] = []
+            try:
+                conv["anomalies"] = json.loads(conv.get("anomaly_json") or "[]")
+            except:
+                conv["anomalies"] = []
+            try:
+                conv["daily_breakdown"] = json.loads(conv.get("daily_breakdown_json") or "{}")
+            except:
+                conv["daily_breakdown"] = {}
+
+            conv["first_date"] = conv.get("first_date") or (conv.get("first_seen_at", "")[:10] if conv.get("first_seen_at") else conv.get("date", "Unknown"))
+            conv["id"] = conv["conv_id"]
+            conv["short_id"] = conv["conv_id"][:8]
+            ledger[conv["conv_id"]] = conv
+        return ledger
+    finally:
+        conn.close()
 
 def save_conversations_to_ledger(conversations_list, db_path=None):
     target_path = db_path or DB_PATH
     init_database(target_path)
     conn = get_db_connection(target_path)
-    cur = conn.cursor()
     now_str = datetime.utcnow().isoformat() + "Z"
-    
-    for c in conversations_list:
-        models_json = json.dumps(c.get("models") or [c.get("primary_model")])
-        tools_json = json.dumps(c.get("tools") or {})
-        trace_json = json.dumps(c.get("trace") or [])
-        anomaly_json = json.dumps(c.get("anomalies") or [])
-        
-        cur.execute('''INSERT INTO conversations_ledger (
-            conv_id, date, project, primary_model, models_json,
-            fresh_input_tokens, cached_context_tokens, output_tokens, thinking_tokens, tool_call_tokens,
-            total_tokens, cost_uncached_usd, cost_cached_usd, invocations,
-            first_seen_at, last_updated_at, is_active, tools_json, trace_json, anomaly_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(conv_id) DO UPDATE SET
-            date = excluded.date,
-            project = excluded.project,
-            primary_model = excluded.primary_model,
-            models_json = excluded.models_json,
-            fresh_input_tokens = excluded.fresh_input_tokens,
-            cached_context_tokens = excluded.cached_context_tokens,
-            output_tokens = excluded.output_tokens,
-            thinking_tokens = excluded.thinking_tokens,
-            tool_call_tokens = excluded.tool_call_tokens,
-            total_tokens = excluded.total_tokens,
-            cost_uncached_usd = excluded.cost_uncached_usd,
-            cost_cached_usd = excluded.cost_cached_usd,
-            invocations = excluded.invocations,
-            last_updated_at = excluded.last_updated_at,
-            is_active = excluded.is_active,
-            tools_json = excluded.tools_json,
-            trace_json = excluded.trace_json,
-            anomaly_json = excluded.anomaly_json
-        ''', (
-            c["id"], c["date"], c["project"], c["primary_model"], models_json,
-            c["fresh_input_tokens"], c["cached_context_tokens"], c["output_tokens"], c["thinking_tokens"], c["tool_call_tokens"],
-            c["total_tokens"], c["cost_uncached_usd"], c["cost_cached_usd"], c["invocations"],
-            now_str, now_str, c.get("is_active", 1), tools_json, trace_json, anomaly_json
-        ))
-    
-    cur.execute('''INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_sync', ?)''', (now_str,))
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            cur = conn.cursor()
+            for c in conversations_list:
+                models_json = json.dumps(c.get("models") or [c.get("primary_model")])
+                tools_json = json.dumps(c.get("tools") or {})
+                trace_json = json.dumps(c.get("trace") or [])
+                anomaly_json = json.dumps(c.get("anomalies") or [])
+                daily_breakdown_json = json.dumps(c.get("daily_breakdown") or {})
+                first_date = str(c.get("first_date") or c.get("date") or "")
+                
+                cur.execute('''INSERT INTO conversations_ledger (
+                    conv_id, date, project, primary_model, models_json,
+                    fresh_input_tokens, cached_context_tokens, output_tokens, thinking_tokens, tool_call_tokens,
+                    total_tokens, cost_uncached_usd, cost_cached_usd, invocations,
+                    first_seen_at, last_updated_at, is_active, tools_json, trace_json, anomaly_json,
+                    daily_breakdown_json, first_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conv_id) DO UPDATE SET
+                    date = excluded.date,
+                    project = excluded.project,
+                    primary_model = excluded.primary_model,
+                    models_json = excluded.models_json,
+                    fresh_input_tokens = excluded.fresh_input_tokens,
+                    cached_context_tokens = excluded.cached_context_tokens,
+                    output_tokens = excluded.output_tokens,
+                    thinking_tokens = excluded.thinking_tokens,
+                    tool_call_tokens = excluded.tool_call_tokens,
+                    total_tokens = excluded.total_tokens,
+                    cost_uncached_usd = excluded.cost_uncached_usd,
+                    cost_cached_usd = excluded.cost_cached_usd,
+                    invocations = excluded.invocations,
+                    last_updated_at = excluded.last_updated_at,
+                    is_active = excluded.is_active,
+                    tools_json = excluded.tools_json,
+                    trace_json = excluded.trace_json,
+                    anomaly_json = excluded.anomaly_json,
+                    daily_breakdown_json = excluded.daily_breakdown_json,
+                    first_date = excluded.first_date
+                ''', (
+                    c["id"], c["date"], c["project"], c["primary_model"], models_json,
+                    c.get("fresh_input_tokens", 0), c.get("cached_context_tokens", 0),
+                    c.get("output_tokens", 0), c.get("thinking_tokens", 0), c.get("tool_call_tokens", 0),
+                    c.get("total_tokens", 0), c.get("cost_uncached_usd", 0.0), c.get("cost_cached_usd", 0.0),
+                    c.get("invocations", 0), now_str, now_str, c.get("is_active", 1),
+                    tools_json, trace_json, anomaly_json, daily_breakdown_json, first_date
+                ))
+            
+            cur.execute('''INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_sync', ?)''', (now_str,))
+    finally:
+        conn.close()
 
 def format_local_date(created_at_str: str) -> str:
     if not created_at_str:
@@ -495,7 +638,15 @@ def scan_live_brain(brain_path=None) -> tuple:
     )
     workspace_regex = re.compile(r"\[URI\] -> \[CorpusName\]:\s*\n([^\n]+)", re.MULTILINE)
     home_user_esc = re.escape(os.path.basename(os.path.expanduser("~")))
-    path_regex = re.compile(rf"/(?:Users|home)/{home_user_esc}/([a-zA-Z0-9_\-\.]+)(?:/([a-zA-Z0-9_\-\.]+))?")
+    path_regex = re.compile(
+        rf"(?:(?:[A-Za-z]:)?[\\/](?:Users|home)[\\/]{home_user_esc}[\\/])([^\\/\r\n\"\'`]+)(?:[\\/]([^\\/\r\n\"\'`]+))?",
+        re.IGNORECASE
+    )
+    ignored_path_roots = {
+        '.gemini', '.vscode', '.local', 'Library', 'Applications', 'Users', 'home',
+        home_user_esc, 'tempmediaStorage', 'Projects', 'Projectss', 'Documents', 'Desktop', 'Downloads',
+        '.config', 'AppData', 'Local', 'Roaming', 'src', 'lib', 'dist', 'build', 'tests', 'test', 'scripts', 'node_modules'
+    }
     
     scanned_convs = []
     global_tool_metrics = defaultdict(lambda: {"invocations": 0, "argument_tokens": 0})
@@ -508,7 +659,7 @@ def scan_live_brain(brain_path=None) -> tuple:
         latest_date = None
         conv_daily_stats = defaultdict(lambda: {
             "tokens": 0, "fresh_input_tokens": 0, "cached_context_tokens": 0,
-            "output_tokens": 0, "thinking_tokens": 0,
+            "output_tokens": 0, "tool_call_tokens": 0, "thinking_tokens": 0,
             "cost_uncached_usd": 0.0, "cost_cached_usd": 0.0, "invocations": 0
         })
         
@@ -526,149 +677,175 @@ def scan_live_brain(brain_path=None) -> tuple:
         models_in_conv = set()
         conv_tools_count = defaultdict(int)
         raw_steps_profile = []
+        anomalies = []
 
         try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                for line_no, line in enumerate(f, 1):
                     line_str = line.strip()
                     if not line_str:
                         continue
                     try:
                         step = json.loads(line_str)
-                    except:
+                    except Exception:
+                        if len(anomalies) < 5:
+                            anomalies.append(f"Malformed JSON at line {line_no}")
                         continue
                     
-                    stype = step.get("type", "")
-                    content = step.get("content") or ""
-                    thinking = step.get("thinking") or ""
-                    tool_calls = step.get("tool_calls") or []
-                    created_at = step.get("created_at")
-                    step_date = format_local_date(created_at) if created_at else (latest_date or datetime.now().strftime("%Y-%m-%d"))
-                    if created_at and not first_date:
-                        first_date = step_date
-                    if created_at:
-                        latest_date = step_date
-                    
-                    if "Model Selection" in content:
-                        for m_from, m_to in model_regex.findall(content):
-                            m_to = m_to.strip()
-                            if m_to and m_to != "None":
-                                current_model = m_to
-                    
-                    models_in_conv.add(current_model)
-                    pricing = get_pricing(current_model)
-                    model_limit = get_model_context_limit(current_model)
-                    
-                    if not detected_project:
-                        w_match = workspace_regex.search(content)
-                        if w_match:
-                            detected_project = clean_project_name(w_match.group(1))
-                        else:
-                            for p1, p2 in path_regex.findall(content):
-                                if p1 not in ('.gemini', '.vscode', '.local', 'Library', 'Applications'):
-                                    detected_project = p2 if p1 == 'Downloads' and p2 else p1
-                                    break
-
-                    # Detect Antigravity compaction / checkpoint events
-                    is_compaction = (
-                        stype == "CHECKPOINT" or
-                        "Resuming from a compaction" in content or
-                        content.strip().startswith("{{ CHECKPOINT") or
-                        "The earlier parts of this conversation have been truncated" in content
-                    )
-                    if is_compaction:
-                        summary_tokens = estimate_tokens(content)
-                        # Compaction resets working context down to the summary checkpoint + base instructions (~8k-15k tokens)
-                        accumulated_history_tokens = min(model_limit, max(8_000, summary_tokens))
-                        fresh_turn_input_tokens = 0
+                    if not isinstance(step, dict):
+                        if len(anomalies) < 5:
+                            anomalies.append(f"Invalid step structure at line {line_no}")
                         continue
 
-                    # Filter out error messages from backend overload/rate-limiting retries
-                    if stype == "ERROR_MESSAGE" and ("overloaded" in content.lower() or "rate limit" in content.lower() or "model output error" in content.lower()):
-                        continue
-                    
-                    # Track tools
-                    step_tools = []
-                    tool_tok = 0
-                    if tool_calls:
-                        tool_tok = estimate_tokens(json.dumps(tool_calls))
-                        for tc in tool_calls:
-                            t_name = tc.get("name") or tc.get("function", {}).get("name") or "tool"
-                            conv_tools_count[t_name] += 1
-                            step_tools.append(t_name)
-                            global_tool_metrics[t_name]["invocations"] += 1
-                            global_tool_metrics[t_name]["argument_tokens"] += int(tool_tok / len(tool_calls))
+                    try:
+                        stype = step.get("type", "")
+                        content = step.get("content") or ""
+                        if not isinstance(content, str):
+                            content = json.dumps(content) if content else ""
+                        thinking = step.get("thinking") or ""
+                        if not isinstance(thinking, str):
+                            thinking = json.dumps(thinking) if thinking else ""
+                        tool_calls = step.get("tool_calls") or []
+                        if not isinstance(tool_calls, list):
+                            tool_calls = []
+                        created_at = step.get("created_at")
+                        step_date = format_local_date(created_at) if created_at else (latest_date or datetime.now().strftime("%Y-%m-%d"))
+                        if created_at and not first_date:
+                            first_date = step_date
+                        if created_at:
+                            latest_date = step_date
+                        
+                        if "Model Selection" in content:
+                            for m_from, m_to in model_regex.findall(content):
+                                m_to = m_to.strip()
+                                if m_to and m_to != "None":
+                                    current_model = m_to
+                        
+                        models_in_conv.add(current_model)
+                        pricing = get_pricing(current_model)
+                        model_limit = get_model_context_limit(current_model)
+                        
+                        if not detected_project:
+                            w_match = workspace_regex.search(content)
+                            if w_match:
+                                detected_project = clean_project_name(w_match.group(1))
+                            else:
+                                for p1, p2 in path_regex.findall(content):
+                                    candidate = p2 if (p1 in ignored_path_roots and p2) else p1
+                                    if candidate and candidate not in ignored_path_roots:
+                                        detected_project = clean_project_name(candidate)
+                                        break
 
-                    if stype == "PLANNER_RESPONSE":
-                        out_tok = estimate_tokens(content)
-                        total_step_out = out_tok + tool_tok
-                        thk_tok = estimate_tokens(thinking)
-
-                        # Skip empty failed turns (0 out, 0 tools, 0 thinking - aborted or overloaded API response)
-                        if total_step_out == 0 and thk_tok == 0 and not content.strip():
+                        # Detect Antigravity compaction / checkpoint events
+                        is_compaction = (
+                            stype == "CHECKPOINT" or
+                            "Resuming from a compaction" in content or
+                            content.strip().startswith("{{ CHECKPOINT") or
+                            "The earlier parts of this conversation have been truncated" in content
+                        )
+                        if is_compaction:
+                            summary_tokens = estimate_tokens(content)
+                            accumulated_history_tokens = min(model_limit, max(8_000, summary_tokens))
+                            fresh_turn_input_tokens = 0
                             continue
 
-                        conv_invocations += 1
+                        # Filter out error messages from backend overload/rate-limiting retries
+                        if stype == "ERROR_MESSAGE" and ("overloaded" in content.lower() or "rate limit" in content.lower() or "model output error" in content.lower()):
+                            continue
                         
-                        # Context window is physically bounded by model limits
-                        step_fresh_in = min(fresh_turn_input_tokens, model_limit)
-                        step_cached_in = min(accumulated_history_tokens, max(0, model_limit - step_fresh_in))
-                        step_total_in = step_fresh_in + step_cached_in
-                        
-                        cost_step_uncached = (
-                            (step_total_in / 1_000_000.0) * pricing["input_uncached"] +
-                            (total_step_out / 1_000_000.0) * pricing["output"] +
-                            (thk_tok / 1_000_000.0) * pricing["thinking"]
-                        )
-                        
-                        cost_step_cached = (
-                            (step_fresh_in / 1_000_000.0) * pricing["input_uncached"] +
-                            (step_cached_in / 1_000_000.0) * pricing["input_cached_read"] +
-                            (total_step_out / 1_000_000.0) * pricing["output"] +
-                            (thk_tok / 1_000_000.0) * pricing["thinking"]
-                        )
-                        
-                        conv_fresh_in += step_fresh_in
-                        conv_cached_in += step_cached_in
-                        conv_out += total_step_out
-                        conv_thinking += thk_tok
-                        conv_tools += tool_tok
-                        conv_cost_uncached += cost_step_uncached
-                        conv_cost_cached += cost_step_cached
+                        # Track tools
+                        step_tools = []
+                        tool_tok = 0
+                        if tool_calls:
+                            tool_tok = estimate_tokens(json.dumps(tool_calls))
+                            for tc in tool_calls:
+                                if isinstance(tc, dict):
+                                    t_name = tc.get("name") or tc.get("function", {}).get("name") or "tool"
+                                else:
+                                    t_name = "tool"
+                                conv_tools_count[t_name] += 1
+                                step_tools.append(t_name)
+                                global_tool_metrics[t_name]["invocations"] += 1
+                                global_tool_metrics[t_name]["argument_tokens"] += int(tool_tok / max(1, len(tool_calls)))
 
-                        step_total_tok = step_fresh_in + step_cached_in + total_step_out + thk_tok
-                        conv_daily_stats[step_date]["tokens"] += step_total_tok
-                        conv_daily_stats[step_date]["fresh_input_tokens"] += step_fresh_in
-                        conv_daily_stats[step_date]["cached_context_tokens"] += step_cached_in
-                        conv_daily_stats[step_date]["output_tokens"] += total_step_out
-                        conv_daily_stats[step_date]["thinking_tokens"] += thk_tok
-                        conv_daily_stats[step_date]["cost_uncached_usd"] += cost_step_uncached
-                        conv_daily_stats[step_date]["cost_cached_usd"] += cost_step_cached
-                        conv_daily_stats[step_date]["invocations"] += 1
-                        
-                        raw_steps_profile.append({
-                            "turn": conv_invocations,
-                            "date": step_date,
-                            "context": step_cached_in,
-                            "out": total_step_out,
-                            "thk": thk_tok,
-                            "tools": step_tools,
-                            "cost": round(cost_step_cached, 4)
-                        })
+                        if stype == "PLANNER_RESPONSE":
+                            out_tok = estimate_tokens(content)
+                            thk_tok = estimate_tokens(thinking)
+                            billed_step_out = out_tok + tool_tok
 
-                        accumulated_history_tokens = min(
-                            model_limit,
-                            accumulated_history_tokens + step_fresh_in + total_step_out + thk_tok
-                        )
-                        fresh_turn_input_tokens = 0
-                    else:
-                        step_tokens = estimate_tokens(content)
-                        fresh_turn_input_tokens += step_tokens
-        except Exception:
-            continue
+                            # Skip empty failed turns (0 out, 0 tools, 0 thinking - aborted or overloaded API response)
+                            if billed_step_out == 0 and thk_tok == 0 and not content.strip():
+                                continue
+
+                            conv_invocations += 1
+                            
+                            # Context window is physically bounded by model limits
+                            step_fresh_in = min(fresh_turn_input_tokens, model_limit)
+                            step_cached_in = min(accumulated_history_tokens, max(0, model_limit - step_fresh_in))
+                            step_total_in = step_fresh_in + step_cached_in
+                            
+                            cost_step_uncached = (
+                                (step_total_in / 1_000_000.0) * pricing["input_uncached"] +
+                                (billed_step_out / 1_000_000.0) * pricing["output"] +
+                                (thk_tok / 1_000_000.0) * pricing["thinking"]
+                            )
+                            
+                            cost_step_cached = (
+                                (step_fresh_in / 1_000_000.0) * pricing["input_uncached"] +
+                                (step_cached_in / 1_000_000.0) * pricing["input_cached_read"] +
+                                (billed_step_out / 1_000_000.0) * pricing["output"] +
+                                (thk_tok / 1_000_000.0) * pricing["thinking"]
+                            )
+                            
+                            conv_fresh_in += step_fresh_in
+                            conv_cached_in += step_cached_in
+                            conv_out += out_tok
+                            conv_tools += tool_tok
+                            conv_thinking += thk_tok
+                            conv_cost_uncached += cost_step_uncached
+                            conv_cost_cached += cost_step_cached
+
+                            step_total_tok = step_fresh_in + step_cached_in + out_tok + tool_tok + thk_tok
+                            conv_daily_stats[step_date]["tokens"] += step_total_tok
+                            conv_daily_stats[step_date]["fresh_input_tokens"] += step_fresh_in
+                            conv_daily_stats[step_date]["cached_context_tokens"] += step_cached_in
+                            conv_daily_stats[step_date]["output_tokens"] += out_tok
+                            conv_daily_stats[step_date]["tool_call_tokens"] += tool_tok
+                            conv_daily_stats[step_date]["thinking_tokens"] += thk_tok
+                            conv_daily_stats[step_date]["cost_uncached_usd"] += cost_step_uncached
+                            conv_daily_stats[step_date]["cost_cached_usd"] += cost_step_cached
+                            conv_daily_stats[step_date]["invocations"] += 1
+                            
+                            raw_steps_profile.append({
+                                "turn": conv_invocations,
+                                "date": step_date,
+                                "context": step_cached_in,
+                                "out": billed_step_out,
+                                "thk": thk_tok,
+                                "tools": step_tools,
+                                "cost": round(cost_step_cached, 4)
+                            })
+
+                            accumulated_history_tokens = min(
+                                model_limit,
+                                accumulated_history_tokens + step_fresh_in + billed_step_out + thk_tok
+                            )
+                            fresh_turn_input_tokens = 0
+                        else:
+                            step_tokens = estimate_tokens(content)
+                            fresh_turn_input_tokens += step_tokens
+                    except Exception as step_err:
+                        anomalies.append(f"Turn {conv_invocations+1} processing error: {type(step_err).__name__}")
+                        continue
+        except Exception as file_err:
+            print(f"⚠️  Quota: warning reading {file_path}: {file_err}", file=sys.stderr)
+            if conv_invocations > 0:
+                anomalies.append(f"Partial scan (file error: {type(file_err).__name__})")
+            else:
+                continue
         
         project_name = detected_project or "General"
-        conv_total_tokens = conv_fresh_in + conv_cached_in + conv_out + conv_thinking
+        conv_total_tokens = conv_fresh_in + conv_cached_in + conv_out + conv_tools + conv_thinking
         
         # Downsample trace if long to keep payload ultra-fast (<35 points)
         downsampled_trace = []
@@ -684,7 +861,6 @@ def scan_live_brain(brain_path=None) -> tuple:
             downsampled_trace.append(raw_steps_profile[-1])
 
         # Anomaly / Runaway tagging
-        anomalies = []
         if conv_invocations >= 75:
             anomalies.append(f"Deep Session ({conv_invocations} turns)")
         if accumulated_history_tokens >= 120_000:
@@ -768,7 +944,7 @@ def merge_ledger_and_live(brain_path=None, db_path=None, rebuild=False) -> dict:
         "scanned_at": datetime.utcnow().isoformat() + "Z"
     }
     overall["cache_savings_usd"] = round(overall["cost_uncached_usd"] - overall["cost_cached_usd"], 2)
-    overall["unique_content_tokens"] = overall["fresh_input_tokens"] + overall["output_tokens"] + overall["thinking_tokens"]
+    overall["unique_content_tokens"] = overall["fresh_input_tokens"] + overall["output_tokens"] + overall["tool_call_tokens"] + overall["thinking_tokens"]
     
     if overall["total_input_tokens"] > 0:
         overall["cache_hit_ratio_pct"] = round(
@@ -814,15 +990,15 @@ def merge_ledger_and_live(brain_path=None, db_path=None, rebuild=False) -> dict:
         "invocations": 0
     })
 
-    family_summary = {
-        "Google": {"tokens": 0, "cost_uncached": 0.0, "cost_cached": 0.0, "invocations": 0},
-        "Anthropic": {"tokens": 0, "cost_uncached": 0.0, "cost_cached": 0.0, "invocations": 0}
-    }
+    family_summary = defaultdict(lambda: {"tokens": 0, "cost_uncached": 0.0, "cost_cached": 0.0, "invocations": 0})
+    family_summary["Google"] = {"tokens": 0, "cost_uncached": 0.0, "cost_cached": 0.0, "invocations": 0}
+    family_summary["Anthropic"] = {"tokens": 0, "cost_uncached": 0.0, "cost_cached": 0.0, "invocations": 0}
+    family_summary["OpenAI"] = {"tokens": 0, "cost_uncached": 0.0, "cost_cached": 0.0, "invocations": 0}
 
     for c in all_merged_convs:
         p_name = c.get("project", "General")
         m_name = c.get("primary_model", "Gemini 3.6 Flash (High)")
-        fam = get_pricing(m_name)["family"]
+        fam = get_pricing(m_name).get("family", "Other")
         
         m = model_stats[m_name]
         m["family"] = fam
@@ -836,11 +1012,10 @@ def merge_ledger_and_live(brain_path=None, db_path=None, rebuild=False) -> dict:
         m["cost_uncached_usd"] += c.get("cost_uncached_usd", 0.0)
         m["cost_cached_usd"] += c.get("cost_cached_usd", 0.0)
         
-        if fam in family_summary:
-            family_summary[fam]["tokens"] += c.get("total_tokens", 0)
-            family_summary[fam]["cost_uncached"] += c.get("cost_uncached_usd", 0.0)
-            family_summary[fam]["cost_cached"] += c.get("cost_cached_usd", 0.0)
-            family_summary[fam]["invocations"] += c.get("invocations", 0)
+        family_summary[fam]["tokens"] += c.get("total_tokens", 0)
+        family_summary[fam]["cost_uncached"] += c.get("cost_uncached_usd", 0.0)
+        family_summary[fam]["cost_cached"] += c.get("cost_cached_usd", 0.0)
+        family_summary[fam]["invocations"] += c.get("invocations", 0)
             
         p = project_stats[p_name]
         p["tokens"] += c.get("total_tokens", 0)
@@ -879,9 +1054,10 @@ def merge_ledger_and_live(brain_path=None, db_path=None, rebuild=False) -> dict:
                 ds["cost_cached_usd"] += c.get("cost_cached_usd", 0.0)
                 ds["invocations"] += c.get("invocations", 0)
 
-    for fam in family_summary:
+    for fam in list(family_summary.keys()):
         family_summary[fam]["cost_uncached"] = round(family_summary[fam]["cost_uncached"], 2)
         family_summary[fam]["cost_cached"] = round(family_summary[fam]["cost_cached"], 2)
+    family_summary = dict(family_summary)
 
     model_serialized = {}
     for k, v in model_stats.items():
@@ -925,7 +1101,8 @@ def merge_ledger_and_live(brain_path=None, db_path=None, rebuild=False) -> dict:
 
     month_cost = round(sum(v["cost_cached_usd"] for d, v in daily_stats.items() if d.startswith(month_prefix)), 2)
     day_of_month = max(1, datetime.now().day)
-    projected_month = round((month_cost / day_of_month) * 30, 2)
+    days_in_month = calendar.monthrange(datetime.now().year, datetime.now().month)[1]
+    projected_month = round((month_cost / day_of_month) * days_in_month, 2)
     
     daily_target = budget_cfg["daily_usd"]
     monthly_target = budget_cfg["monthly_usd"]
@@ -958,12 +1135,13 @@ def merge_ledger_and_live(brain_path=None, db_path=None, rebuild=False) -> dict:
     if os.path.exists(target_brain):
         for entry in os.scandir(target_brain):
             if entry.is_dir() and entry.name != 'tempmediaStorage':
-                tf = os.path.join(entry.path, ".system_generated", "logs", "transcript.jsonl")
-                if os.path.exists(tf):
-                    mt = os.path.getmtime(tf)
-                    if mt > latest_mt:
-                        latest_mt = mt
-                        latest_cid = entry.name
+                for cand_name in ["transcript_full.jsonl", "transcript.jsonl"]:
+                    tf = os.path.join(entry.path, ".system_generated", "logs", cand_name)
+                    if os.path.exists(tf):
+                        mt = os.path.getmtime(tf)
+                        if mt > latest_mt:
+                            latest_mt = mt
+                            latest_cid = entry.name
     if latest_cid and latest_cid in existing_ledger:
         active_session_data = existing_ledger[latest_cid]
     elif all_merged_convs:
@@ -982,14 +1160,8 @@ def merge_ledger_and_live(brain_path=None, db_path=None, rebuild=False) -> dict:
         "pricing_table": PRICING_TABLE
     }
     
-    tmp_ledger = LEDGER_JSON + f".tmp.{os.getpid()}"
-    with open(tmp_ledger, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
-    try:
-        os.chmod(tmp_ledger, 0o600)
-    except:
-        pass
-    os.replace(tmp_ledger, LEDGER_JSON)
+    atomic_write_json(LEDGER_JSON, result)
+    atomic_write_json(TOKEN_DATA_JSON, result)
         
     mirror_backups(result)
     return result
@@ -998,9 +1170,7 @@ def mirror_backups(data):
     try:
         os.makedirs(BACKUP_DIR_LOCAL, exist_ok=True)
         local_target = os.path.join(BACKUP_DIR_LOCAL, "ledger_backup.json")
-        with open(local_target, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.chmod(local_target, 0o600)
+        atomic_write_json(local_target, data)
     except Exception:
         pass
 
@@ -1009,21 +1179,7 @@ def mirror_backups(data):
         try:
             os.makedirs(ICLOUD_BACKUP_DIR, exist_ok=True)
             icloud_target = os.path.join(ICLOUD_BACKUP_DIR, "antigravity_token_ledger_backup.json")
-            with open(icloud_target, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except Exception:
-            pass
-
-    # Keep project root persistent_ledger synced if running in workspace
-    base_json = os.path.join(BASE_DIR, "persistent_ledger.json")
-    if os.path.abspath(base_json) != os.path.abspath(LEDGER_JSON):
-        try:
-            with open(base_json, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            os.chmod(base_json, 0o600)
-            base_sqlite = os.path.join(BASE_DIR, "persistent_ledger.sqlite")
-            if os.path.exists(DB_PATH) and os.path.abspath(base_sqlite) != os.path.abspath(DB_PATH):
-                shutil.copy2(DB_PATH, base_sqlite)
+            atomic_write_json(icloud_target, data)
         except Exception:
             pass
 
@@ -1043,10 +1199,10 @@ def export_csv_file(data: dict, target_file_path: str):
             savings = round(uncached - cached, 2)
             anom_str = "; ".join(c.get("anomalies", []))
             writer.writerow([
-                c.get("date", "Unknown"),
-                c.get("id", ""),
-                c.get("project", "General"),
-                c.get("primary_model", ""),
+                safe_csv_cell(c.get("date", "Unknown")),
+                safe_csv_cell(c.get("id", "")),
+                safe_csv_cell(c.get("project", "General")),
+                safe_csv_cell(c.get("primary_model", "")),
                 c.get("invocations", 0),
                 c.get("fresh_input_tokens", 0),
                 c.get("cached_context_tokens", 0),
@@ -1058,7 +1214,7 @@ def export_csv_file(data: dict, target_file_path: str):
                 f"{cached:.2f}",
                 f"{savings:.2f}",
                 "Active" if c.get("is_active", 1) else "Archived",
-                anom_str
+                safe_csv_cell(anom_str)
             ])
     print(f"✅ Full token ledger CSV exported to: {target_file_path}")
 
@@ -1132,7 +1288,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https: vscode-resource:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data: https:;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:;">
   <title>Quota</title>
   <style>
     :root {
@@ -2169,7 +2325,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
     }
 
     // Monotone Cubic Spline (Fritsch-Carlson) - Mathematically prevents negative overshoots
-    function getMonotoneSplinePath(points, baselineY) {
+    function getMonotoneSplinePath(points, baselineY, padTop = 30) {
       const n = points.length;
       if (n === 0) return '';
       if (n === 1) return `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
@@ -2198,7 +2354,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       tangents[n - 1] = slopes[n - 2];
 
       for (let i = 0; i < n - 1; i++) {
-        if (dy[i] === 0) {
+        if (dy[i] === 0 || slopes[i] === 0) {
           tangents[i] = 0;
           tangents[i + 1] = 0;
         } else {
@@ -2223,9 +2379,9 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
         let cp2x = points[i + 1].x - segDx;
         let cp2y = points[i + 1].y - tangents[i + 1] * segDx;
 
-        // Guaranteed baseline clamping: strictly non-negative
-        cp1y = Math.min(baselineY, cp1y);
-        cp2y = Math.min(baselineY, cp2y);
+        // Guaranteed symmetric boundary clamping: between top bound and baseline
+        cp1y = Math.max(padTop, Math.min(baselineY, cp1y));
+        cp2y = Math.max(padTop, Math.min(baselineY, cp2y));
 
         path += ` C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${points[i + 1].x.toFixed(1)},${points[i + 1].y.toFixed(1)}`;
       }
@@ -2288,7 +2444,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
         points.push({ x, y, val, d });
       });
 
-      const splinePath = getMonotoneSplinePath(points, baselineY);
+      const splinePath = getMonotoneSplinePath(points, baselineY, padTop);
       const lastPt = points[points.length - 1];
       const firstPt = points[0];
       const areaPath = splinePath + ` L ${lastPt.x.toFixed(1)},${baselineY} L ${firstPt.x.toFixed(1)},${baselineY} Z`;
@@ -2319,12 +2475,15 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       }
       if (data.length > 0) {
         const lastIdx = data.length - 1;
-        // Suppress ticks within 2 indices before the last index to guarantee zero overlap
+        // Suppress ticks within 2 indices before the last index to guarantee zero overlap, but keep index 0
         const minGap = Math.max(2, Math.floor(labelStep * 0.7));
         for (let off = 1; off <= minGap; off++) {
-          labelIndices.delete(lastIdx - off);
+          if (lastIdx - off > 0) {
+            labelIndices.delete(lastIdx - off);
+          }
         }
         labelIndices.add(lastIdx);
+        labelIndices.add(0);
       }
 
       points.forEach((p, i) => {
@@ -2395,7 +2554,9 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
         if (timelineMetric === 'tokens') return item.tokens || 0;
         return item.invocations || 0;
       });
-      const maxVal = Math.max(...values, timelineMetric === 'cost' ? 1.0 : (timelineMetric === 'tokens' ? 100000 : 10));
+      const rawMax = Math.max(...values);
+      const minCeil = timelineMetric === 'cost' ? 1.0 : (timelineMetric === 'tokens' ? 100000 : 10);
+      const maxVal = Math.max(rawMax * 1.15, minCeil);
 
       const val = values[idx];
       const denom = data.length > 1 ? (data.length - 1) : 1;
@@ -2510,8 +2671,8 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
         <div class="dense-item">
           <div class="dense-top">
             <span class="dense-name" style="display:flex; align-items:center; gap:6px;">
-              <span class="legend-dot" style="background: ${fam === 'Google' ? '#3b82f6' : (fam === 'Anthropic' ? '#f59e0b' : '#8b5cf6')};"></span>
-              ${fam === 'Google' ? 'Google Gemini' : (fam === 'Anthropic' ? 'Anthropic Claude' : fam)}
+              <span class="legend-dot" style="background: ${fam === 'Google' ? '#3b82f6' : (fam === 'Anthropic' ? '#f59e0b' : '#10b981')};"></span>
+              ${fam === 'Google' ? 'Google Gemini' : (fam === 'Anthropic' ? 'Anthropic Claude' : (fam === 'OpenAI' ? 'OpenAI GPT' : escapeHtml(fam)))}
             </span>
             <span class="dense-val">${formatNumber(d.tokens)}</span>
           </div>
@@ -2527,32 +2688,36 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       if (donutContainer) {
         const gTok = (fams.Google && fams.Google.tokens) || 0;
         const aTok = (fams.Anthropic && fams.Anthropic.tokens) || 0;
-        const totTok = gTok + aTok;
-        let gPct = 0, aPct = 0;
+        const oTok = (fams.OpenAI && fams.OpenAI.tokens) || 0;
+        const totTok = gTok + aTok + oTok;
+        let gPct = 0, aPct = 0, oPct = 0;
         let dominantName = 'Google';
         let dominantPct = 0;
         if (totTok > 0) {
           gPct = (gTok / totTok) * 100;
           aPct = (aTok / totTok) * 100;
-          if (gPct >= aPct) {
-            dominantName = 'Google';
-            dominantPct = Math.round(gPct);
-          } else {
-            dominantName = 'Anthropic';
-            dominantPct = Math.round(aPct);
+          oPct = (oTok / totTok) * 100;
+          const sortedFams = Object.entries(fams).sort((a,b) => (b[1].tokens || 0) - (a[1].tokens || 0));
+          if (sortedFams.length && sortedFams[0][1].tokens > 0) {
+            dominantName = sortedFams[0][0];
+            dominantPct = Math.round(((sortedFams[0][1].tokens || 0) / totTok) * 100);
           }
         }
         const gDash = gPct.toFixed(1);
         const aDash = aPct.toFixed(1);
+        const oDash = oPct.toFixed(1);
+        const aOffset = (-gPct).toFixed(1);
+        const oOffset = (-(gPct + aPct)).toFixed(1);
         donutContainer.innerHTML = `
           <div style="position: relative; width: 110px; height: 110px; flex-shrink: 0;">
             <svg width="110" height="110" viewBox="0 0 36 36">
               <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#2563eb" stroke-width="3.6" stroke-dasharray="${gDash}, 100" />
-              <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#f59e0b" stroke-width="3.6" stroke-dasharray="${aDash}, 100" stroke-dashoffset="-${gDash}" />
+              <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#f59e0b" stroke-width="3.6" stroke-dasharray="${aDash}, 100" stroke-dashoffset="${aOffset}" />
+              <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#10b981" stroke-width="3.6" stroke-dasharray="${oDash}, 100" stroke-dashoffset="${oOffset}" />
             </svg>
             <div style="position: absolute; top:0; left:0; width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center;">
               <span style="font-size: 15px; font-weight: 700;">${totTok > 0 ? dominantPct + '%' : '0%'}</span>
-              <span style="font-size: 9px; color: var(--text-tertiary);">${totTok > 0 ? dominantName : 'None'}</span>
+              <span style="font-size: 9px; color: var(--text-tertiary);">${totTok > 0 ? escapeHtml(dominantName) : 'None'}</span>
             </div>
           </div>
         `;
@@ -2564,8 +2729,8 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       wList.innerHTML = sortedW.map(([name, d]) => `
         <div class="dense-item">
           <div class="dense-top">
-            <span class="dense-name">${escapeHtml(name)} <span style="font-size:10px; color:var(--text-tertiary); font-weight:normal;">(${d.conversations} chats)</span></span>
-            <span class="dense-val">${formatNumber(d.tokens)} &bull; $${d.cost_uncached_usd.toFixed(2)}</span>
+            <span class="dense-name">${escapeHtml(name)} <span style="font-size:10px; color:var(--text-tertiary); font-weight:normal;">(${d.conversations || 0} chats)</span></span>
+            <span class="dense-val">${formatNumber(d.tokens)} &bull; $${(d.cost_uncached_usd || 0).toFixed(2)}</span>
           </div>
           <div class="dense-track">
             <div class="dense-fill" style="width: ${(d.tokens / maxWTok) * 100}%;"></div>
@@ -2582,14 +2747,14 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
         .sort((a,b) => b[1].total_tokens - a[1].total_tokens)
         .map(([name, m]) => `
           <tr>
-            <td style="font-weight: 600; color: var(--text-primary);">${name}</td>
-            <td><span class="badge-pill ${m.family === 'Google' ? 'badge-blue' : 'badge-amber'}">${m.family}</span></td>
+            <td style="font-weight: 600; color: var(--text-primary);">${escapeHtml(name)}</td>
+            <td><span class="badge-pill ${m.family === 'Google' ? 'badge-blue' : (m.family === 'Anthropic' ? 'badge-amber' : 'badge-green')}">${escapeHtml(m.family)}</span></td>
             <td class="mono">${formatNumber(m.total_tokens)}</td>
             <td class="mono">${(m.output_tokens || 0).toLocaleString()}</td>
             <td class="mono">${(m.thinking_tokens || 0).toLocaleString()}</td>
             <td class="mono">${(m.tool_call_tokens || 0).toLocaleString()}</td>
-            <td class="mono" style="color: #34d399; font-weight:600;">$${m.cost_uncached_usd.toFixed(2)}</td>
-            <td class="mono" style="color: #60a5fa;">$${m.cost_cached_usd.toFixed(2)}</td>
+            <td class="mono" style="color: #34d399; font-weight:600;">$${(m.cost_uncached_usd || 0).toFixed(2)}</td>
+            <td class="mono" style="color: #60a5fa;">$${(m.cost_cached_usd || 0).toFixed(2)}</td>
           </tr>
         `).join('');
     }
@@ -2602,7 +2767,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       const totalInvs = tools.reduce((acc, curr) => acc + curr[1].invocations, 0) || 1;
       tbody.innerHTML = tools.map(([tName, d]) => `
         <tr>
-          <td style="font-family: var(--font-mono); font-weight: 600; color: #93c5fd;">${tName}</td>
+          <td style="font-family: var(--font-mono); font-weight: 600; color: #93c5fd;">${escapeHtml(tName)}</td>
           <td class="mono">${d.invocations.toLocaleString()}</td>
           <td class="mono">${formatNumber(d.argument_tokens)}</td>
           <td>
@@ -2625,13 +2790,13 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
         .sort((a,b) => b[1].tokens - a[1].tokens)
         .map(([pName, p]) => `
           <tr>
-            <td style="font-weight: 600; color: var(--text-primary);">${pName}</td>
+            <td style="font-weight: 600; color: var(--text-primary);">${escapeHtml(pName)}</td>
             <td class="mono">${p.conversations}</td>
             <td class="mono">${(p.invocations || 0).toLocaleString()}</td>
             <td class="mono">${formatNumber(p.tokens)}</td>
-            <td class="mono" style="color: #34d399; font-weight:600;">$${p.cost_uncached_usd.toFixed(2)}</td>
-            <td class="mono" style="color: #60a5fa;">$${p.cost_cached_usd.toFixed(2)}</td>
-            <td style="font-size:11px; color:var(--text-tertiary);">${(p.models || []).slice(0, 2).join(', ')}</td>
+            <td class="mono" style="color: #34d399; font-weight:600;">$${(p.cost_uncached_usd || 0).toFixed(2)}</td>
+            <td class="mono" style="color: #60a5fa;">$${(p.cost_cached_usd || 0).toFixed(2)}</td>
+            <td style="font-size:11px; color:var(--text-tertiary);">${(p.models || []).slice(0, 2).map(escapeHtml).join(', ')}</td>
           </tr>
         `).join('');
     }
@@ -2641,10 +2806,10 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
     function renderChats(chats) {
       const tbody = document.getElementById('chats-table-body');
       tbody.innerHTML = chats.map(c => `
-        <tr class="clickable-row" onclick="openDrawer('${c.id}')">
-          <td class="mono" style="color: var(--text-tertiary);">${c.date || 'Unknown'}</td>
-          <td style="font-weight: 500; color: var(--text-primary);">${c.project || 'General'}</td>
-          <td><span class="badge-pill ${c.primary_model && c.primary_model.includes('Claude') ? 'badge-amber' : 'badge-blue'}">${c.primary_model || 'Unknown'}</span></td>
+        <tr class="clickable-row" data-conv-id="${escapeHtml(c.id)}">
+          <td class="mono" style="color: var(--text-tertiary);">${escapeHtml(c.date || 'Unknown')}</td>
+          <td style="font-weight: 500; color: var(--text-primary);">${escapeHtml(c.project || 'General')}</td>
+          <td><span class="badge-pill ${c.primary_model && c.primary_model.includes('Claude') ? 'badge-amber' : (c.primary_model && c.primary_model.includes('OpenAI') ? 'badge-green' : 'badge-blue')}">${escapeHtml(c.primary_model || 'Unknown')}</span></td>
           <td class="mono">${c.invocations || 0}</td>
           <td class="mono">${formatNumber((c.fresh_input_tokens || 0) + (c.cached_context_tokens || 0))}</td>
           <td class="mono">${(c.output_tokens || 0).toLocaleString()}</td>
@@ -2652,10 +2817,17 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
           <td class="mono" style="color: #34d399; font-weight: 600;">$${(c.cost_uncached_usd || 0).toFixed(2)}</td>
           <td class="mono" style="color: #60a5fa;">$${(c.cost_cached_usd || 0).toFixed(2)}</td>
           <td>
-            ${(c.anomalies || []).map(a => `<span class="badge-pill badge-rose" style="margin-right:4px;">${a}</span>`).join('') || '<span style="color:var(--text-tertiary); font-size:10px;">Normal</span>'}
+            ${(c.anomalies || []).map(a => `<span class="badge-pill badge-rose" style="margin-right:4px;">${escapeHtml(a)}</span>`).join('') || '<span style="color:var(--text-tertiary); font-size:10px;">Normal</span>'}
           </td>
         </tr>
       `).join('');
+
+      tbody.querySelectorAll('tr[data-conv-id]').forEach(row => {
+        row.addEventListener('click', () => {
+          const cid = row.getAttribute('data-conv-id');
+          if (cid) openDrawer(cid);
+        });
+      });
     }
     renderChats(DATA.conversations || []);
 
@@ -2680,12 +2852,26 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       renderChats(filtered);
     }
 
-    // Populate Filter Selects
+    // Populate Filter Selects safely
     function populateFilters() {
       const mSel = document.getElementById('chat-model-filter');
       const pSel = document.getElementById('chat-project-filter');
-      Object.keys(DATA.models || {}).forEach(m => mSel.innerHTML += `<option value="${m}">${m}</option>`);
-      Object.keys(DATA.projects || {}).forEach(p => pSel.innerHTML += `<option value="${p}">${p}</option>`);
+      if (mSel) {
+        Object.keys(DATA.models || {}).forEach(m => {
+          const opt = document.createElement('option');
+          opt.value = m;
+          opt.textContent = m;
+          mSel.appendChild(opt);
+        });
+      }
+      if (pSel) {
+        Object.keys(DATA.projects || {}).forEach(p => {
+          const opt = document.createElement('option');
+          opt.value = p;
+          opt.textContent = p;
+          pSel.appendChild(opt);
+        });
+      }
     }
     populateFilters();
 
@@ -2754,7 +2940,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       // Render Tool Pills
       const toolEntries = Object.entries(conv.tools || {});
       document.getElementById('drawer-tools-pills').innerHTML = toolEntries.length
-        ? toolEntries.map(([t, count]) => `<div class="tool-pill">${t} <span>${count}x</span></div>`).join('')
+        ? toolEntries.map(([t, count]) => `<div class="tool-pill">${escapeHtml(t)} <span>${count}x</span></div>`).join('')
         : '<span style="color:var(--text-tertiary); font-size:11px;">No tool executions in this conversation</span>';
 
       // Render Stepper Table
@@ -2764,7 +2950,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
           <td class="mono">#${t.turn}</td>
           <td class="mono">${formatNumber(t.context)}</td>
           <td class="mono">${t.out}</td>
-          <td style="font-size:10px; color:#93c5fd;">${(t.tools || []).join(', ') || '-'}</td>
+          <td style="font-size:10px; color:#93c5fd;">${(t.tools || []).map(escapeHtml).join(', ') || '-'}</td>
           <td class="mono" style="color:#34d399;">$${(t.cost || 0).toFixed(3)}</td>
         </tr>
       `).join('');
@@ -2918,9 +3104,6 @@ def get_logo_base64():
         os.path.join(BASE_DIR, "icon.png"),
         os.path.join(BASE_DIR, "logo_256.png"),
         os.path.join(BASE_DIR, "logo.png"),
-        os.path.expanduser("~/Projects/antigravity-token-tracker/icon.png"),
-        os.path.expanduser("~/Projects/antigravity-token-tracker/logo_256.png"),
-        os.path.expanduser("~/Projects/antigravity-token-tracker/logo.png")
     ]
     for p in candidates:
         if os.path.exists(p):
@@ -2932,9 +3115,12 @@ def get_logo_base64():
                 pass
     return ""
 
-def generate_dashboard_html(data, out_dir=BASE_DIR):
+def generate_dashboard_html(data, out_dir=None):
+    if out_dir is None:
+        out_dir = DATA_DIR
+    os.makedirs(out_dir, exist_ok=True)
     html_path = os.path.join(out_dir, "dashboard.html")
-    data_json = json.dumps(data)
+    data_json = json.dumps(data).replace('</', '<\\/')
     logo_b64 = get_logo_base64()
     html_content = ENTERPRISE_HTML_TEMPLATE.replace("__DATA_PLACEHOLDER__", data_json)
     html_content = html_content.replace("__LOGO_PLACEHOLDER__", logo_b64)
@@ -2965,6 +3151,13 @@ if __name__ == "__main__":
 
     if args.set_budget:
         daily, monthly = args.set_budget
+        import math
+        if not math.isfinite(daily) or daily < 0.10:
+            print("❌ Error: Daily budget must be a finite number >= 0.10", file=sys.stderr)
+            sys.exit(1)
+        if not math.isfinite(monthly) or monthly < 1.00:
+            print("❌ Error: Monthly budget must be a finite number >= 1.00", file=sys.stderr)
+            sys.exit(1)
         save_budget(daily, monthly)
         print(f"✅ Budget guardrails updated: ${daily:.2f}/day, ${monthly:.2f}/month")
         sys.exit(0)
@@ -2983,7 +3176,7 @@ if __name__ == "__main__":
         print("⚠️  SIMULATION: Testing 100% disaster recovery with deleted ~/.gemini directory...")
 
     results = merge_ledger_and_live(brain_path=brain_to_use, rebuild=args.rebuild)
-    dash_path = generate_dashboard_html(results)
+    dash_path = generate_dashboard_html(results, DATA_DIR)
 
     if args.export_csv:
         export_csv_file(results, args.export_csv)

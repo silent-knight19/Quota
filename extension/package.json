@@ -5,7 +5,6 @@
   "version": "1.2.0",
   "publisher": "SachinSingh",
   "license": "MIT",
-  "pricing": "Free",
   "repository": {
     "type": "git",
     "url": "https://github.com/silent-knight19/quota"
@@ -73,6 +72,26 @@
       },
       {
         "command": "antigravity-tracker.showQuickSummary",
+        "title": "Show Quota Summary",
+        "category": "Quota"
+      },
+      {
+        "command": "quota.quickMenu",
+        "title": "Open Quota Quick Actions",
+        "category": "Quota"
+      },
+      {
+        "command": "quota.openDashboard",
+        "title": "Open Quota Dashboard",
+        "category": "Quota"
+      },
+      {
+        "command": "quota.refresh",
+        "title": "Refresh Quota Data",
+        "category": "Quota"
+      },
+      {
+        "command": "quota.showQuickSummary",
         "title": "Show Quota Summary",
         "category": "Quota"
       }

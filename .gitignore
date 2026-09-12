@@ -74,6 +74,7 @@ credentials.json
 scratch/
 test_*.js
 test_*.py
+!tests/**
 
 # ==============================================================================
 # OPERATING SYSTEM & IDE METADATA
