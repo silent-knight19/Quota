@@ -108,10 +108,5 @@
       }
     }
   },
-  "icon": "icon.png",
-  "__metadata": {
-    "installedTimestamp": 1788504700638,
-    "targetPlatform": "undefined",
-    "size": 554637
-  }
+  "icon": "icon.png"
 }

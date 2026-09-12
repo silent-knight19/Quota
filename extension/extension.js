@@ -9,6 +9,7 @@ let currentWebview = null;
 let refreshTimer = null;
 let pollInterval = null;
 let isScanning = false;
+let pendingScan = false;
 let lastKnownMtime = 0;
 let lastKnownSize = 0;
 let lastUpdatedTimestamp = new Date();
@@ -82,8 +83,10 @@ function formatCompact(num) {
 }
 
 function formatCurrency(val) {
-  if (!val || isNaN(val)) return '$0.00';
-  return '$' + Number(val).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (val === undefined || val === null || isNaN(val)) return '$0.00';
+  const n = Number(val);
+  const sign = n < 0 ? '-' : '';
+  return sign + '$' + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function loadTokenData(context) {
@@ -100,6 +103,10 @@ function loadTokenData(context) {
 }
 
 function getCurrentWorkspaceName() {
+  if (vscode.window.activeTextEditor) {
+    const folder = vscode.workspace.getWorkspaceFolder(vscode.window.activeTextEditor.document.uri);
+    if (folder) return folder.name;
+  }
   const folders = vscode.workspace.workspaceFolders;
   if (folders && folders.length > 0) {
     return folders[0].name;
@@ -135,6 +142,11 @@ function getProjectStats(data, projectName) {
 }
 
 function getDisplayMode(context) {
+  const config = vscode.workspace.getConfiguration('quota');
+  const cfgMode = config.get('statusBarMode');
+  if (cfgMode && ['session', 'workspace', 'total'].includes(cfgMode)) {
+    return cfgMode;
+  }
   const ctx = context || extensionContext;
   return (ctx && ctx.globalState ? ctx.globalState.get('statusBarMode', 'session') : 'session');
 }
@@ -144,6 +156,8 @@ function setDisplayMode(context, mode) {
   if (ctx && ctx.globalState) {
     ctx.globalState.update('statusBarMode', mode);
   }
+  const config = vscode.workspace.getConfiguration('quota');
+  config.update('statusBarMode', mode, vscode.ConfigurationTarget.Global).then(null, () => {});
   updateStatusBar(ctx);
 }
 
@@ -174,7 +188,7 @@ function updateStatusBar(context) {
     detailDesc = `[Workspace: ${currentProject}]\n• Total Turns: ${projStats.invocations || 0}\n• Active Sessions: ${projStats.conversations || 0}\n• Standard API Value: ${formatCurrency(projStats.cost_uncached_usd)}`;
   } else {
     label = `✨ ${formatCompact(s.total_cumulative_tokens)} Tokens | ${formatCurrency(s.cost_cached_usd)}`;
-    detailDesc = `[Lifetime Global Total]\n• Total Volume: ${formatCompact(s.total_cumulative_tokens)} (${(s.cache_hit_ratio_pct || 99.9)}% Cache Hit)\n• Standard Value: ${formatCurrency(s.cost_uncached_usd)}\n• Autonomous Turns: ${(s.total_invocations || 0).toLocaleString()}`;
+    detailDesc = `[Lifetime Global Total]\n• Total Volume: ${formatCompact(s.total_cumulative_tokens)} (${(s.cache_hit_ratio_pct !== undefined && s.cache_hit_ratio_pct !== null ? s.cache_hit_ratio_pct : 0)}% Cache Hit)\n• Standard Value: ${formatCurrency(s.cost_uncached_usd)}\n• Autonomous Turns: ${(s.total_invocations || 0).toLocaleString()}`;
   }
 
   statusBarItem.text = label;
@@ -191,10 +205,21 @@ function updateStatusBar(context) {
 
 // Secure Process Execution using execFile (Zero Shell Injection)
 function runTrackerInBackground(callback) {
-  if (isScanning) return;
+  if (isScanning) {
+    pendingScan = true;
+    if (callback) callback();
+    return;
+  }
   isScanning = true;
 
   const { trackerScript, dataDir } = getPaths(extensionContext);
+  if (!fs.existsSync(trackerScript)) {
+    console.error('Quota: tracker.py not found at', trackerScript);
+    isScanning = false;
+    if (callback) callback(new Error('tracker.py missing'));
+    return;
+  }
+
   const pythonBin = getPythonExecutable();
   const args = [trackerScript, '--data-dir', dataDir];
 
@@ -227,6 +252,11 @@ function runTrackerInBackground(callback) {
       }
     }
     if (callback) callback(error);
+
+    if (pendingScan) {
+      pendingScan = false;
+      setTimeout(() => runTrackerInBackground(), 400);
+    }
   });
 }
 
@@ -305,6 +335,17 @@ function openDashboard(context) {
         });
       } else if (message.command === 'exportCsv') {
         exportCsvFileQuick(context);
+      } else if (message.command === 'setBudget' && message.daily && message.monthly) {
+        const { trackerScript, dataDir } = getPaths(context || extensionContext);
+        const pythonBin = getPythonExecutable();
+        execFile(pythonBin, [trackerScript, '--data-dir', dataDir, '--set-budget', String(message.daily), String(message.monthly)], (err) => {
+          if (err) {
+            vscode.window.showErrorMessage('Quota: Failed to update budget: ' + err.message);
+          } else {
+            vscode.window.showInformationMessage(`Quota: Budget updated to $${message.daily}/day, $${message.monthly}/month`);
+            runTrackerInBackground();
+          }
+        });
       }
     },
     undefined,
@@ -442,6 +483,10 @@ function activate(context) {
         });
       });
     }),
+    vscode.commands.registerCommand('quota.quickMenu', () => showQuickControlMenu(context)),
+    vscode.commands.registerCommand('quota.openDashboard', () => openDashboard(context)),
+    vscode.commands.registerCommand('quota.refresh', () => vscode.commands.executeCommand('antigravity-tracker.refresh')),
+    vscode.commands.registerCommand('quota.showQuickSummary', () => vscode.commands.executeCommand('antigravity-tracker.showQuickSummary')),
     vscode.commands.registerCommand('antigravity-tracker.showQuickSummary', () => {
       const data = loadTokenData(context);
       if (!data) return;
@@ -461,7 +506,12 @@ function activate(context) {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(() => updateStatusBar(context)),
-    vscode.window.onDidChangeActiveTextEditor(() => updateStatusBar(context))
+    vscode.window.onDidChangeActiveTextEditor(() => updateStatusBar(context)),
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('quota')) {
+        updateStatusBar(context);
+      }
+    })
   );
 
   // Initial update

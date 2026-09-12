@@ -10,8 +10,12 @@ node_modules/**
 scratch/**
 tests/**
 logo.png
+persistent_ledger.json
+token_data.json
 *.sqlite*
 *.tmp*
+*.vsix
+*.csv
 package_extension.sh
 publish_extension.sh
 PUBLISHING_GUIDE.md

@@ -12,6 +12,7 @@ import re
 import csv
 import io
 import sqlite3
+import shutil
 import argparse
 from datetime import datetime
 from collections import defaultdict
@@ -54,6 +55,83 @@ ensure_data_migration()
 
 # Enterprise Model Pricing Table ($ per Million Tokens)
 PRICING_TABLE = {
+    "Claude Opus 4.6 (Thinking)": {
+        "family": "Anthropic",
+        "input_uncached": 15.00,
+        "input_cached_read": 1.50,
+        "output": 75.00,
+        "thinking": 75.00,
+    },
+    "Claude Sonnet 4.6 (Thinking)": {
+        "family": "Anthropic",
+        "input_uncached": 3.00,
+        "input_cached_read": 0.30,
+        "output": 15.00,
+        "thinking": 15.00,
+    },
+    "Claude 3.5 Sonnet": {
+        "family": "Anthropic",
+        "input_uncached": 3.00,
+        "input_cached_read": 0.30,
+        "output": 15.00,
+        "thinking": 15.00,
+    },
+    "Claude 3.5 Haiku": {
+        "family": "Anthropic",
+        "input_uncached": 0.80,
+        "input_cached_read": 0.08,
+        "output": 4.00,
+        "thinking": 4.00,
+    },
+    "Gemini 3.1 Pro (High)": {
+        "family": "Google",
+        "input_uncached": 1.25,
+        "input_cached_read": 0.3125,
+        "output": 5.00,
+        "thinking": 5.00,
+    },
+    "Gemini 2.0 Flash": {
+        "family": "Google",
+        "input_uncached": 0.10,
+        "input_cached_read": 0.025,
+        "output": 0.40,
+        "thinking": 0.40,
+    },
+    "Gemini 1.5 Pro": {
+        "family": "Google",
+        "input_uncached": 1.25,
+        "input_cached_read": 0.3125,
+        "output": 5.00,
+        "thinking": 5.00,
+    },
+    "Gemini 1.5 Flash": {
+        "family": "Google",
+        "input_uncached": 0.075,
+        "input_cached_read": 0.01875,
+        "output": 0.30,
+        "thinking": 0.30,
+    },
+    "GPT-4o": {
+        "family": "OpenAI",
+        "input_uncached": 2.50,
+        "input_cached_read": 1.25,
+        "output": 10.00,
+        "thinking": 10.00,
+    },
+    "GPT-4o-mini": {
+        "family": "OpenAI",
+        "input_uncached": 0.15,
+        "input_cached_read": 0.075,
+        "output": 0.60,
+        "thinking": 0.60,
+    },
+    "o1": {
+        "family": "OpenAI",
+        "input_uncached": 15.00,
+        "input_cached_read": 7.50,
+        "output": 60.00,
+        "thinking": 60.00,
+    },
     "Claude Opus 4.6 (Thinking)": {
         "family": "Anthropic",
         "input_uncached": 15.00,
@@ -154,17 +232,62 @@ PRICING_TABLE = {
     }
 }
 
+# Physical Context Window Limits per Model Family
+CONTEXT_WINDOW_LIMITS = {
+    "Claude": 200_000,
+    "Gemini": 200_000,
+    "Default": 200_000,
+}
+
+def get_model_context_limit(model_name: str) -> int:
+    name_low = (model_name or "").lower()
+    for prefix, limit in CONTEXT_WINDOW_LIMITS.items():
+        if prefix.lower() in name_low:
+            return limit
+    return CONTEXT_WINDOW_LIMITS["Default"]
+
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, int(len(text) / 3.8))
 
 def get_pricing(model_name: str) -> dict:
+    if not model_name:
+        return PRICING_TABLE["Default"]
     if model_name in PRICING_TABLE:
         return PRICING_TABLE[model_name]
-    for k in PRICING_TABLE:
-        if k in model_name:
-            return PRICING_TABLE[k]
+
+    name_low = model_name.strip().lower()
+    for k, v in PRICING_TABLE.items():
+        if k.lower() == name_low:
+            return v
+
+    for k, v in PRICING_TABLE.items():
+        k_low = k.lower()
+        if k_low in name_low or name_low in k_low:
+            return v
+
+    if "opus" in name_low:
+        return PRICING_TABLE["Claude Opus 4.6 (Thinking)"]
+    if "sonnet" in name_low:
+        return PRICING_TABLE["Claude Sonnet 4.6 (Thinking)"]
+    if "haiku" in name_low:
+        return PRICING_TABLE["Claude 3.5 Haiku"]
+    if "gpt-4o-mini" in name_low:
+        return PRICING_TABLE["GPT-4o-mini"]
+    if "gpt-4o" in name_low or "gpt-4" in name_low:
+        return PRICING_TABLE["GPT-4o"]
+    if "o1" in name_low or "o3" in name_low:
+        return PRICING_TABLE["o1"]
+    if "pro" in name_low and ("gemini" in name_low or "google" in name_low):
+        return PRICING_TABLE["Gemini 3.1 Pro (High)"]
+    if "flash" in name_low:
+        return PRICING_TABLE["Gemini 3.8 Flash (High)"]
+    if "claude" in name_low:
+        return PRICING_TABLE["Claude Sonnet 4.6 (Thinking)"]
+    if "gemini" in name_low:
+        return PRICING_TABLE["Gemini 3.8 Flash (High)"]
+
     return PRICING_TABLE["Default"]
 
 def clean_project_name(path_or_str: str) -> str:
@@ -259,10 +382,11 @@ def init_database(db_path=None):
     conn.commit()
     conn.close()
 
-def load_ledger_from_db(db_path=DB_PATH) -> dict:
-    if not os.path.exists(db_path):
-        init_database(db_path)
-    conn = get_db_connection(db_path)
+def load_ledger_from_db(db_path=None) -> dict:
+    target_path = db_path or DB_PATH
+    if not os.path.exists(target_path):
+        init_database(target_path)
+    conn = get_db_connection(target_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute('SELECT * FROM conversations_ledger')
@@ -294,9 +418,10 @@ def load_ledger_from_db(db_path=DB_PATH) -> dict:
     conn.close()
     return ledger
 
-def save_conversations_to_ledger(conversations_list, db_path=DB_PATH):
-    init_database(db_path)
-    conn = get_db_connection(db_path)
+def save_conversations_to_ledger(conversations_list, db_path=None):
+    target_path = db_path or DB_PATH
+    init_database(target_path)
+    conn = get_db_connection(target_path)
     cur = conn.cursor()
     now_str = datetime.utcnow().isoformat() + "Z"
     
@@ -317,15 +442,15 @@ def save_conversations_to_ledger(conversations_list, db_path=DB_PATH):
             project = excluded.project,
             primary_model = excluded.primary_model,
             models_json = excluded.models_json,
-            fresh_input_tokens = MAX(conversations_ledger.fresh_input_tokens, excluded.fresh_input_tokens),
-            cached_context_tokens = MAX(conversations_ledger.cached_context_tokens, excluded.cached_context_tokens),
-            output_tokens = MAX(conversations_ledger.output_tokens, excluded.output_tokens),
-            thinking_tokens = MAX(conversations_ledger.thinking_tokens, excluded.thinking_tokens),
-            tool_call_tokens = MAX(conversations_ledger.tool_call_tokens, excluded.tool_call_tokens),
-            total_tokens = MAX(conversations_ledger.total_tokens, excluded.total_tokens),
-            cost_uncached_usd = MAX(conversations_ledger.cost_uncached_usd, excluded.cost_uncached_usd),
-            cost_cached_usd = MAX(conversations_ledger.cost_cached_usd, excluded.cost_cached_usd),
-            invocations = MAX(conversations_ledger.invocations, excluded.invocations),
+            fresh_input_tokens = excluded.fresh_input_tokens,
+            cached_context_tokens = excluded.cached_context_tokens,
+            output_tokens = excluded.output_tokens,
+            thinking_tokens = excluded.thinking_tokens,
+            tool_call_tokens = excluded.tool_call_tokens,
+            total_tokens = excluded.total_tokens,
+            cost_uncached_usd = excluded.cost_uncached_usd,
+            cost_cached_usd = excluded.cost_cached_usd,
+            invocations = excluded.invocations,
             last_updated_at = excluded.last_updated_at,
             is_active = excluded.is_active,
             tools_json = excluded.tools_json,
@@ -342,16 +467,27 @@ def save_conversations_to_ledger(conversations_list, db_path=DB_PATH):
     conn.commit()
     conn.close()
 
-def scan_live_brain(brain_path=BRAIN_DIR) -> tuple:
-    if not os.path.exists(brain_path):
+def format_local_date(created_at_str: str) -> str:
+    if not created_at_str:
+        return datetime.now().strftime("%Y-%m-%d")
+    try:
+        clean = created_at_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean).astimezone()
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return created_at_str[:10] if len(created_at_str) >= 10 else datetime.now().strftime("%Y-%m-%d")
+
+def scan_live_brain(brain_path=None) -> tuple:
+    target_brain = brain_path or BRAIN_DIR
+    if not os.path.exists(target_brain):
         return [], {}
 
-    full_pattern = os.path.join(brain_path, "*", ".system_generated", "logs", "transcript_full.jsonl")
-    fallback_pattern = os.path.join(brain_path, "*", ".system_generated", "logs", "transcript.jsonl")
-    
-    files = glob.glob(full_pattern)
-    if not files:
-        files = glob.glob(fallback_pattern)
+    session_files = {}
+    for p in glob.glob(os.path.join(target_brain, "*", ".system_generated", "logs", "transcript*.jsonl")):
+        cid = p.split(os.sep)[-4]
+        if cid not in session_files or p.endswith("transcript_full.jsonl"):
+            session_files[cid] = p
+    files = sorted(session_files.values())
         
     model_regex = re.compile(
         r"The user changed setting `Model Selection` from ([^`]+?) to ([^`]+?)\.\s*No need to comment",
@@ -364,11 +500,17 @@ def scan_live_brain(brain_path=BRAIN_DIR) -> tuple:
     scanned_convs = []
     global_tool_metrics = defaultdict(lambda: {"invocations": 0, "argument_tokens": 0})
 
-    for file_path in sorted(files):
+    for file_path in files:
         conv_id = file_path.split(os.sep)[-4]
         current_model = "Gemini 3.6 Flash (High)"
         detected_project = None
-        created_date = None
+        first_date = None
+        latest_date = None
+        conv_daily_stats = defaultdict(lambda: {
+            "tokens": 0, "fresh_input_tokens": 0, "cached_context_tokens": 0,
+            "output_tokens": 0, "thinking_tokens": 0,
+            "cost_uncached_usd": 0.0, "cost_cached_usd": 0.0, "invocations": 0
+        })
         
         accumulated_history_tokens = 0
         fresh_turn_input_tokens = 0
@@ -401,9 +543,11 @@ def scan_live_brain(brain_path=BRAIN_DIR) -> tuple:
                     thinking = step.get("thinking") or ""
                     tool_calls = step.get("tool_calls") or []
                     created_at = step.get("created_at")
-                    
-                    if created_at and not created_date:
-                        created_date = created_at[:10]
+                    step_date = format_local_date(created_at) if created_at else (latest_date or datetime.now().strftime("%Y-%m-%d"))
+                    if created_at and not first_date:
+                        first_date = step_date
+                    if created_at:
+                        latest_date = step_date
                     
                     if "Model Selection" in content:
                         for m_from, m_to in model_regex.findall(content):
@@ -413,6 +557,7 @@ def scan_live_brain(brain_path=BRAIN_DIR) -> tuple:
                     
                     models_in_conv.add(current_model)
                     pricing = get_pricing(current_model)
+                    model_limit = get_model_context_limit(current_model)
                     
                     if not detected_project:
                         w_match = workspace_regex.search(content)
@@ -423,6 +568,24 @@ def scan_live_brain(brain_path=BRAIN_DIR) -> tuple:
                                 if p1 not in ('.gemini', '.vscode', '.local', 'Library', 'Applications'):
                                     detected_project = p2 if p1 == 'Downloads' and p2 else p1
                                     break
+
+                    # Detect Antigravity compaction / checkpoint events
+                    is_compaction = (
+                        stype == "CHECKPOINT" or
+                        "Resuming from a compaction" in content or
+                        content.strip().startswith("{{ CHECKPOINT") or
+                        "The earlier parts of this conversation have been truncated" in content
+                    )
+                    if is_compaction:
+                        summary_tokens = estimate_tokens(content)
+                        # Compaction resets working context down to the summary checkpoint + base instructions (~8k-15k tokens)
+                        accumulated_history_tokens = min(model_limit, max(8_000, summary_tokens))
+                        fresh_turn_input_tokens = 0
+                        continue
+
+                    # Filter out error messages from backend overload/rate-limiting retries
+                    if stype == "ERROR_MESSAGE" and ("overloaded" in content.lower() or "rate limit" in content.lower() or "model output error" in content.lower()):
+                        continue
                     
                     # Track tools
                     step_tools = []
@@ -437,13 +600,19 @@ def scan_live_brain(brain_path=BRAIN_DIR) -> tuple:
                             global_tool_metrics[t_name]["argument_tokens"] += int(tool_tok / len(tool_calls))
 
                     if stype == "PLANNER_RESPONSE":
-                        conv_invocations += 1
                         out_tok = estimate_tokens(content)
                         total_step_out = out_tok + tool_tok
                         thk_tok = estimate_tokens(thinking)
+
+                        # Skip empty failed turns (0 out, 0 tools, 0 thinking - aborted or overloaded API response)
+                        if total_step_out == 0 and thk_tok == 0 and not content.strip():
+                            continue
+
+                        conv_invocations += 1
                         
-                        step_fresh_in = fresh_turn_input_tokens
-                        step_cached_in = accumulated_history_tokens
+                        # Context window is physically bounded by model limits
+                        step_fresh_in = min(fresh_turn_input_tokens, model_limit)
+                        step_cached_in = min(accumulated_history_tokens, max(0, model_limit - step_fresh_in))
                         step_total_in = step_fresh_in + step_cached_in
                         
                         cost_step_uncached = (
@@ -466,17 +635,31 @@ def scan_live_brain(brain_path=BRAIN_DIR) -> tuple:
                         conv_tools += tool_tok
                         conv_cost_uncached += cost_step_uncached
                         conv_cost_cached += cost_step_cached
+
+                        step_total_tok = step_fresh_in + step_cached_in + total_step_out + thk_tok
+                        conv_daily_stats[step_date]["tokens"] += step_total_tok
+                        conv_daily_stats[step_date]["fresh_input_tokens"] += step_fresh_in
+                        conv_daily_stats[step_date]["cached_context_tokens"] += step_cached_in
+                        conv_daily_stats[step_date]["output_tokens"] += total_step_out
+                        conv_daily_stats[step_date]["thinking_tokens"] += thk_tok
+                        conv_daily_stats[step_date]["cost_uncached_usd"] += cost_step_uncached
+                        conv_daily_stats[step_date]["cost_cached_usd"] += cost_step_cached
+                        conv_daily_stats[step_date]["invocations"] += 1
                         
                         raw_steps_profile.append({
                             "turn": conv_invocations,
-                            "context": accumulated_history_tokens,
+                            "date": step_date,
+                            "context": step_cached_in,
                             "out": total_step_out,
                             "thk": thk_tok,
                             "tools": step_tools,
                             "cost": round(cost_step_cached, 4)
                         })
 
-                        accumulated_history_tokens += (step_fresh_in + total_step_out + thk_tok)
+                        accumulated_history_tokens = min(
+                            model_limit,
+                            accumulated_history_tokens + step_fresh_in + total_step_out + thk_tok
+                        )
                         fresh_turn_input_tokens = 0
                     else:
                         step_tokens = estimate_tokens(content)
@@ -516,7 +699,9 @@ def scan_live_brain(brain_path=BRAIN_DIR) -> tuple:
         scanned_convs.append({
             "id": conv_id,
             "short_id": conv_id[:8],
-            "date": created_date or "Unknown",
+            "date": latest_date or first_date or datetime.now().strftime("%Y-%m-%d"),
+            "first_date": first_date or "Unknown",
+            "daily_breakdown": {k: dict(v) for k, v in conv_daily_stats.items()},
             "project": project_name,
             "primary_model": current_model,
             "models": list(models_in_conv),
@@ -537,27 +722,34 @@ def scan_live_brain(brain_path=BRAIN_DIR) -> tuple:
         
     return scanned_convs, dict(global_tool_metrics)
 
-def merge_ledger_and_live(brain_path=BRAIN_DIR, db_path=DB_PATH) -> dict:
-    existing_ledger = load_ledger_from_db(db_path)
-    live_convs, global_tools = scan_live_brain(brain_path)
+def merge_ledger_and_live(brain_path=None, db_path=None, rebuild=False) -> dict:
+    target_brain = brain_path or BRAIN_DIR
+    target_db = db_path or DB_PATH
+    if rebuild:
+        try:
+            conn = get_db_connection(target_db)
+            conn.execute("DELETE FROM conversations_ledger")
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        existing_ledger = {}
+    else:
+        existing_ledger = load_ledger_from_db(target_db)
+
+    live_convs, global_tools = scan_live_brain(target_brain)
     live_map = {c["id"]: c for c in live_convs}
     
     for conv_id, live_c in live_map.items():
-        if conv_id in existing_ledger:
-            past = existing_ledger[conv_id]
-            if live_c["total_tokens"] >= past.get("total_tokens", 0):
-                existing_ledger[conv_id] = live_c
-            existing_ledger[conv_id]["is_active"] = 1
-        else:
-            existing_ledger[conv_id] = live_c
-            existing_ledger[conv_id]["is_active"] = 1
+        existing_ledger[conv_id] = live_c
+        existing_ledger[conv_id]["is_active"] = 1
 
     for conv_id, past in existing_ledger.items():
         if conv_id not in live_map:
             past["is_active"] = 0
 
     all_merged_convs = list(existing_ledger.values())
-    save_conversations_to_ledger(all_merged_convs, db_path)
+    save_conversations_to_ledger(all_merged_convs, target_db)
     
     overall = {
         "total_conversations": len(all_merged_convs),
@@ -662,17 +854,30 @@ def merge_ledger_and_live(brain_path=BRAIN_DIR, db_path=DB_PATH) -> dict:
         p["invocations"] += c.get("invocations", 0)
         p["models"].update(c.get("models") or [m_name])
         
-        d = c.get("date", "Unknown")
-        if d != "Unknown":
-            ds = daily_stats[d]
-            ds["tokens"] += c.get("total_tokens", 0)
-            ds["fresh_input_tokens"] += c.get("fresh_input_tokens", 0)
-            ds["cached_context_tokens"] += c.get("cached_context_tokens", 0)
-            ds["output_tokens"] += c.get("output_tokens", 0)
-            ds["thinking_tokens"] += c.get("thinking_tokens", 0)
-            ds["cost_uncached_usd"] += c.get("cost_uncached_usd", 0.0)
-            ds["cost_cached_usd"] += c.get("cost_cached_usd", 0.0)
-            ds["invocations"] += c.get("invocations", 0)
+        daily_bd = c.get("daily_breakdown")
+        if daily_bd:
+            for d_str, v in daily_bd.items():
+                ds = daily_stats[d_str]
+                ds["tokens"] += v.get("tokens", 0)
+                ds["fresh_input_tokens"] += v.get("fresh_input_tokens", 0)
+                ds["cached_context_tokens"] += v.get("cached_context_tokens", 0)
+                ds["output_tokens"] += v.get("output_tokens", 0)
+                ds["thinking_tokens"] += v.get("thinking_tokens", 0)
+                ds["cost_uncached_usd"] += v.get("cost_uncached_usd", 0.0)
+                ds["cost_cached_usd"] += v.get("cost_cached_usd", 0.0)
+                ds["invocations"] += v.get("invocations", 0)
+        else:
+            d = c.get("date", "Unknown")
+            if d != "Unknown":
+                ds = daily_stats[d]
+                ds["tokens"] += c.get("total_tokens", 0)
+                ds["fresh_input_tokens"] += c.get("fresh_input_tokens", 0)
+                ds["cached_context_tokens"] += c.get("cached_context_tokens", 0)
+                ds["output_tokens"] += c.get("output_tokens", 0)
+                ds["thinking_tokens"] += c.get("thinking_tokens", 0)
+                ds["cost_uncached_usd"] += c.get("cost_uncached_usd", 0.0)
+                ds["cost_cached_usd"] += c.get("cost_cached_usd", 0.0)
+                ds["invocations"] += c.get("invocations", 0)
 
     for fam in family_summary:
         family_summary[fam]["cost_uncached"] = round(family_summary[fam]["cost_uncached"], 2)
@@ -709,15 +914,17 @@ def merge_ledger_and_live(brain_path=BRAIN_DIR, db_path=DB_PATH) -> dict:
 
     # Calculate Budget & Spend Pacing
     budget_cfg = load_budget()
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
-    month_prefix = datetime.utcnow().strftime("%Y-%m")
-    
-    today_data = daily_stats.get(today_str, {"cost_cached_usd": 0.0, "cost_uncached_usd": 0.0, "tokens": 0})
+    today_local = datetime.now().strftime("%Y-%m-%d")
+    today_utc = datetime.utcnow().strftime("%Y-%m-%d")
+    month_prefix = datetime.now().strftime("%Y-%m")
+
+    # Match today's spend from local date first, then UTC
+    today_data = daily_stats.get(today_local) or daily_stats.get(today_utc) or {"cost_cached_usd": 0.0, "cost_uncached_usd": 0.0, "tokens": 0}
     today_cost = round(today_data["cost_cached_usd"], 2)
     today_uncached = round(today_data["cost_uncached_usd"], 2)
-    
+
     month_cost = round(sum(v["cost_cached_usd"] for d, v in daily_stats.items() if d.startswith(month_prefix)), 2)
-    day_of_month = max(1, datetime.utcnow().day)
+    day_of_month = max(1, datetime.now().day)
     projected_month = round((month_cost / day_of_month) * 30, 2)
     
     daily_target = budget_cfg["daily_usd"]
@@ -748,8 +955,8 @@ def merge_ledger_and_live(brain_path=BRAIN_DIR, db_path=DB_PATH) -> dict:
     active_session_data = None
     latest_cid = None
     latest_mt = 0
-    if os.path.exists(brain_path):
-        for entry in os.scandir(brain_path):
+    if os.path.exists(target_brain):
+        for entry in os.scandir(target_brain):
             if entry.is_dir() and entry.name != 'tempmediaStorage':
                 tf = os.path.join(entry.path, ".system_generated", "logs", "transcript.jsonl")
                 if os.path.exists(tf):
@@ -775,12 +982,14 @@ def merge_ledger_and_live(brain_path=BRAIN_DIR, db_path=DB_PATH) -> dict:
         "pricing_table": PRICING_TABLE
     }
     
-    with open(LEDGER_JSON, "w", encoding="utf-8") as f:
+    tmp_ledger = LEDGER_JSON + f".tmp.{os.getpid()}"
+    with open(tmp_ledger, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
     try:
-        os.chmod(LEDGER_JSON, 0o600)
+        os.chmod(tmp_ledger, 0o600)
     except:
         pass
+    os.replace(tmp_ledger, LEDGER_JSON)
         
     mirror_backups(result)
     return result
@@ -802,6 +1011,19 @@ def mirror_backups(data):
             icloud_target = os.path.join(ICLOUD_BACKUP_DIR, "antigravity_token_ledger_backup.json")
             with open(icloud_target, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    # Keep project root persistent_ledger synced if running in workspace
+    base_json = os.path.join(BASE_DIR, "persistent_ledger.json")
+    if os.path.abspath(base_json) != os.path.abspath(LEDGER_JSON):
+        try:
+            with open(base_json, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.chmod(base_json, 0o600)
+            base_sqlite = os.path.join(BASE_DIR, "persistent_ledger.sqlite")
+            if os.path.exists(DB_PATH) and os.path.abspath(base_sqlite) != os.path.abspath(DB_PATH):
+                shutil.copy2(DB_PATH, base_sqlite)
         except Exception:
             pass
 
@@ -1419,6 +1641,10 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       </div>
 
       <div class="header-actions">
+        <button class="btn btn-primary" id="refresh-btn" onclick="handleRefresh()" title="Scan active transcripts and refresh metrics immediately">
+          <svg id="refresh-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          <span id="refresh-label">Refresh Data</span>
+        </button>
         <button class="btn" onclick="exportLedgerCsv()">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           Export CSV
@@ -1521,11 +1747,43 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
 
     <!-- Tab 1: Overview Pane -->
     <div id="tab-overview" class="tab-pane active">
+      <!-- Budget & Spend Pacing Panel -->
+      <div class="panel" style="margin-bottom: 20px;">
+        <div class="panel-header">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <h3 class="panel-title">Budget Guardrails & Spend Pacing</h3>
+            <span class="badge-pill badge-green" id="budget-status-badge">Normal</span>
+          </div>
+          <button class="btn" style="font-size: 11px; padding: 4px 8px;" onclick="openBudgetModal()">Configure Budget</button>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 12px;">
+          <div style="background: var(--card-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px;">
+            <div style="font-size: 11px; color: var(--text-tertiary); text-transform: uppercase;">Today's Spend / Daily Target</div>
+            <div style="font-size: 18px; font-weight: 700; margin: 4px 0;" id="budget-today-text">$0.00 / $5.00</div>
+            <div class="dense-track" style="margin-top: 8px;">
+              <div id="budget-today-bar" class="dense-fill" style="width: 0%; background: #10b981;"></div>
+            </div>
+          </div>
+          <div style="background: var(--card-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px;">
+            <div style="font-size: 11px; color: var(--text-tertiary); text-transform: uppercase;">Month-to-Date / Monthly Target</div>
+            <div style="font-size: 18px; font-weight: 700; margin: 4px 0;" id="budget-month-text">$0.00 / $50.00</div>
+            <div class="dense-track" style="margin-top: 8px;">
+              <div id="budget-month-bar" class="dense-fill" style="width: 0%; background: #3b82f6;"></div>
+            </div>
+          </div>
+          <div style="background: var(--card-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px;">
+            <div style="font-size: 11px; color: var(--text-tertiary); text-transform: uppercase;">Projected Run-Rate (30 Days)</div>
+            <div style="font-size: 18px; font-weight: 700; margin: 4px 0; color: #60a5fa;" id="budget-proj-text">$0.00</div>
+            <div style="font-size: 11px; color: var(--text-tertiary); margin-top: 8px;">Calculated from current calendar velocity</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Segmented Ingestion Bar -->
       <div class="segmented-bar-container">
         <div class="segmented-bar-title">
           <h3>Token Distribution Across Ingestion & Generation Layers</h3>
-          <span class="badge-pill badge-green">99.9% Context Hit Ratio</span>
+          <span class="badge-pill badge-green" id="hit-ratio-badge">99.9% Context Hit Ratio</span>
         </div>
         <div class="segmented-bar-track" id="segmented-track"></div>
         <div class="segment-legend-grid" id="segmented-legend"></div>
@@ -1540,16 +1798,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
             <span style="font-size: 11px; color: var(--text-tertiary);">By volume</span>
           </div>
           <div style="display: flex; align-items: center; gap: 24px;">
-            <div style="position: relative; width: 110px; height: 110px; flex-shrink: 0;">
-              <svg width="110" height="110" viewBox="0 0 36 36">
-                <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#2563eb" stroke-width="3.6" stroke-dasharray="91.5, 100" />
-                <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#f59e0b" stroke-width="3.6" stroke-dasharray="8.5, 100" stroke-dashoffset="-91.5" />
-              </svg>
-              <div style="position: absolute; top:0; left:0; width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center;">
-                <span style="font-size: 15px; font-weight: 700;">92%</span>
-                <span style="font-size: 9px; color: var(--text-tertiary);">Google</span>
-              </div>
-            </div>
+            <div id="provider-donut-container"></div>
             <div style="flex: 1;" class="dense-list" id="provider-list"></div>
           </div>
         </div>
@@ -1716,6 +1965,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
 
 
   <script>
+    const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : null;
     let DATA = __DATA_PLACEHOLDER__;
 
     function escapeHtml(str) {
@@ -1744,23 +1994,88 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       return '$' + Number(val).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     }
 
+    function renderBudget() {
+      const b = DATA.budget || {};
+      const todayText = document.getElementById('budget-today-text');
+      const todayBar = document.getElementById('budget-today-bar');
+      const monthText = document.getElementById('budget-month-text');
+      const monthBar = document.getElementById('budget-month-bar');
+      const projText = document.getElementById('budget-proj-text');
+      const badge = document.getElementById('budget-status-badge');
+
+      const todayCost = b.today_cost_cached || 0;
+      const dailyTarget = b.daily_target_usd || 5.0;
+      const monthCost = b.month_cost_cached || 0;
+      const monthlyTarget = b.monthly_target_usd || 50.0;
+      const projCost = b.projected_month_cost || 0;
+      const status = b.status || 'normal';
+
+      if (todayText) todayText.innerText = `$${todayCost.toFixed(2)} / $${dailyTarget.toFixed(2)}`;
+      if (monthText) monthText.innerText = `$${monthCost.toFixed(2)} / $${monthlyTarget.toFixed(2)}`;
+      if (projText) projText.innerText = `$${projCost.toFixed(2)} USD`;
+
+      const todayPct = Math.min(100, Math.round((todayCost / Math.max(0.01, dailyTarget)) * 100));
+      const monthPct = Math.min(100, Math.round((monthCost / Math.max(0.01, monthlyTarget)) * 100));
+
+      if (todayBar) {
+        todayBar.style.width = todayPct + '%';
+        todayBar.style.background = status === 'exceeded' ? '#f43f5e' : (status === 'warning' ? '#f59e0b' : '#10b981');
+      }
+      if (monthBar) {
+        monthBar.style.width = monthPct + '%';
+        monthBar.style.background = status === 'exceeded' ? '#f43f5e' : (status === 'warning' ? '#f59e0b' : '#3b82f6');
+      }
+
+      if (badge) {
+        badge.innerText = status.toUpperCase();
+        badge.className = 'badge-pill ' + (status === 'exceeded' ? 'badge-rose' : (status === 'warning' ? 'badge-amber' : 'badge-green'));
+      }
+    }
+
+    function openBudgetModal() {
+      const b = DATA.budget || {};
+      document.getElementById('budget-input-daily').value = (b.daily_target_usd || 5).toFixed(2);
+      document.getElementById('budget-input-monthly').value = (b.monthly_target_usd || 50).toFixed(2);
+      document.getElementById('budget-modal').classList.add('open');
+    }
+
+    function closeBudgetModal() {
+      document.getElementById('budget-modal').classList.remove('open');
+    }
+
+    function saveBudgetFromModal() {
+      const daily = parseFloat(document.getElementById('budget-input-daily').value) || 5.0;
+      const monthly = parseFloat(document.getElementById('budget-input-monthly').value) || 50.0;
+      closeBudgetModal();
+      if (vscode) {
+        vscode.postMessage({ command: 'setBudget', daily: daily, monthly: monthly });
+      } else {
+        alert(`Budget updated to $${daily.toFixed(2)}/day, $${monthly.toFixed(2)}/month`);
+      }
+    }
+
     // Init Metrics
     function initMetrics() {
-      const s = DATA.summary;
-      document.getElementById('kpi-volume').innerText = formatNumber(s.total_cumulative_tokens);
-      document.getElementById('kpi-cache-hit').innerText = (s.cache_hit_ratio_pct || 99.9) + '% Cache Hit';
-      document.getElementById('kpi-unique-tok').innerText = formatNumber(s.unique_content_tokens) + ' unique stored';
-      document.getElementById('kpi-std-cost').innerText = formatCurrency(s.cost_uncached_usd);
-      document.getElementById('kpi-cached-cost').innerText = formatCurrency(s.cost_cached_usd);
-      document.getElementById('kpi-savings').innerText = `-${formatCurrency(s.cache_savings_usd)} (${((s.cache_savings_usd/s.cost_uncached_usd)*100).toFixed(1)}%)`;
+      const s = DATA.summary || {};
+      document.getElementById('kpi-volume').innerText = formatNumber(s.total_cumulative_tokens || 0);
+      const hitRatio = (s.cache_hit_ratio_pct !== undefined && s.cache_hit_ratio_pct !== null) ? s.cache_hit_ratio_pct : 0;
+      document.getElementById('kpi-cache-hit').innerText = hitRatio.toFixed(1) + '% Cache Hit';
+      document.getElementById('kpi-unique-tok').innerText = formatNumber(s.unique_content_tokens || 0) + ' unique stored';
+      document.getElementById('kpi-std-cost').innerText = formatCurrency(s.cost_uncached_usd || 0);
+      document.getElementById('kpi-cached-cost').innerText = formatCurrency(s.cost_cached_usd || 0);
+      const savingsPct = (s.cost_uncached_usd && s.cost_uncached_usd > 0)
+        ? (((s.cache_savings_usd || 0) / s.cost_uncached_usd) * 100).toFixed(1)
+        : '0.0';
+      document.getElementById('kpi-savings').innerText = `-${formatCurrency(s.cache_savings_usd || 0)} (${savingsPct}%)`;
 
       // Card 4: Autonomous Invocations
       document.getElementById('kpi-invocations').innerText = (s.total_invocations || 0).toLocaleString();
       document.getElementById('kpi-sessions-badge').innerText = `${s.total_conversations || 0} Sessions`;
       const numProjects = Object.keys(DATA.projects || {}).length;
       document.getElementById('kpi-workspaces-count').innerText = `${numProjects} workspaces`;
-      const avgTurns = s.total_conversations ? Math.round(s.total_invocations / s.total_conversations) : 0;
+      const avgTurns = s.total_conversations ? Math.round((s.total_invocations || 0) / s.total_conversations) : 0;
       document.getElementById('kpi-turns-per-chat').innerText = `Avg ${avgTurns} turns / session`;
+      renderBudget();
     }
     initMetrics();
 
@@ -1827,7 +2142,10 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       const svg = document.getElementById('timeline-svg');
       const statsEl = document.getElementById('timeline-summary-stats');
       const data = getContinuousTimelineData(timelineRange);
-      if (!data.length) return;
+      if (!data || !data.length) {
+        if (svg) svg.innerHTML = '<text x="500" y="110" fill="#71717a" text-anchor="middle" font-size="13">No telemetry data recorded for this period</text>';
+        return;
+      }
 
       const W = 1000, H = 220;
       const padLeft = 65, padRight = 30, padTop = 30, padBottom = 35;
@@ -1866,9 +2184,10 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       const points = [];
       const barWidth = Math.max(8, Math.min(22, (chartW / data.length) * 0.65));
 
+      const denom = data.length > 1 ? (data.length - 1) : 1;
       data.forEach((d, i) => {
         const val = values[i];
-        const x = padLeft + (i / (data.length - 1)) * chartW;
+        const x = data.length === 1 ? (padLeft + chartW / 2) : (padLeft + (i / denom) * chartW);
         const y = baselineY - ((val / maxVal) * chartH);
         points.push({ x, y, val, d });
       });
@@ -1985,7 +2304,8 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       const maxVal = Math.max(...values, timelineMetric === 'cost' ? 1.0 : (timelineMetric === 'tokens' ? 100000 : 10));
 
       const val = values[idx];
-      const x = padLeft + (idx / (data.length - 1)) * chartW;
+      const denom = data.length > 1 ? (data.length - 1) : 1;
+      const x = data.length === 1 ? (padLeft + chartW / 2) : (padLeft + (idx / denom) * chartW);
       const y = baselineY - ((val / maxVal) * chartH);
 
       if (group && line && dot) {
@@ -2046,8 +2366,13 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
 
     // Segmented Ingestion Bar
     function renderSegmentedBar() {
-      const s = DATA.summary;
+      const s = DATA.summary || {};
       const total = s.total_cumulative_tokens || 1;
+      const hitBadge = document.getElementById('hit-ratio-badge');
+      if (hitBadge) {
+        const hitRatio = (s.cache_hit_ratio_pct !== undefined && s.cache_hit_ratio_pct !== null) ? s.cache_hit_ratio_pct : 0;
+        hitBadge.innerText = hitRatio.toFixed(1) + '% Context Hit Ratio';
+      }
       const pCache = ((s.cached_context_tokens || 0) / total) * 100;
       const pFresh = ((s.fresh_input_tokens || 0) / total) * 100;
       const pOut = ((s.output_tokens || 0) / total) * 100;
@@ -2085,22 +2410,59 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
 
     // Provider & Workspace Lists
     function renderOverviewLists() {
+      const fams = DATA.families || {};
       const pList = document.getElementById('provider-list');
-      pList.innerHTML = Object.entries(DATA.families || {}).map(([fam, d]) => `
+      pList.innerHTML = Object.entries(fams).map(([fam, d]) => `
         <div class="dense-item">
           <div class="dense-top">
             <span class="dense-name" style="display:flex; align-items:center; gap:6px;">
-              <span class="legend-dot" style="background: ${fam === 'Google' ? '#3b82f6' : '#f59e0b'};"></span>
-              ${fam === 'Google' ? 'Google Gemini' : 'Anthropic Claude'}
+              <span class="legend-dot" style="background: ${fam === 'Google' ? '#3b82f6' : (fam === 'Anthropic' ? '#f59e0b' : '#8b5cf6')};"></span>
+              ${fam === 'Google' ? 'Google Gemini' : (fam === 'Anthropic' ? 'Anthropic Claude' : fam)}
             </span>
             <span class="dense-val">${formatNumber(d.tokens)}</span>
           </div>
           <div style="font-size: 11px; color: var(--text-secondary); display:flex; justify-content:space-between;">
-            <span>Standard: $${d.cost_uncached.toFixed(2)}</span>
-            <span style="color:#34d399;">Cached: $${d.cost_cached.toFixed(2)}</span>
+            <span>Standard: $${(d.cost_uncached || 0).toFixed(2)}</span>
+            <span style="color:#34d399;">Cached: $${(d.cost_cached || 0).toFixed(2)}</span>
           </div>
         </div>
       `).join('');
+
+      // Dynamic Provider Donut SVG
+      const donutContainer = document.getElementById('provider-donut-container');
+      if (donutContainer) {
+        const gTok = (fams.Google && fams.Google.tokens) || 0;
+        const aTok = (fams.Anthropic && fams.Anthropic.tokens) || 0;
+        const totTok = gTok + aTok;
+        let gPct = 0, aPct = 0;
+        let dominantName = 'Google';
+        let dominantPct = 0;
+        if (totTok > 0) {
+          gPct = (gTok / totTok) * 100;
+          aPct = (aTok / totTok) * 100;
+          if (gPct >= aPct) {
+            dominantName = 'Google';
+            dominantPct = Math.round(gPct);
+          } else {
+            dominantName = 'Anthropic';
+            dominantPct = Math.round(aPct);
+          }
+        }
+        const gDash = gPct.toFixed(1);
+        const aDash = aPct.toFixed(1);
+        donutContainer.innerHTML = `
+          <div style="position: relative; width: 110px; height: 110px; flex-shrink: 0;">
+            <svg width="110" height="110" viewBox="0 0 36 36">
+              <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#2563eb" stroke-width="3.6" stroke-dasharray="${gDash}, 100" />
+              <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#f59e0b" stroke-width="3.6" stroke-dasharray="${aDash}, 100" stroke-dashoffset="-${gDash}" />
+            </svg>
+            <div style="position: absolute; top:0; left:0; width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+              <span style="font-size: 15px; font-weight: 700;">${totTok > 0 ? dominantPct + '%' : '0%'}</span>
+              <span style="font-size: 9px; color: var(--text-tertiary);">${totTok > 0 ? dominantName : 'None'}</span>
+            </div>
+          </div>
+        `;
+      }
 
       const wList = document.getElementById('top-projects-list');
       const sortedW = Object.entries(DATA.projects || {}).sort((a,b) => b[1].tokens - a[1].tokens).slice(0, 5);
@@ -2254,6 +2616,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
 
     // Slide-Over Detail Drawer
     function openDrawer(convId) {
+      activeDrawerConvId = convId;
       const conv = (DATA.conversations || []).find(c => c.id === convId);
       if (!conv) return;
 
@@ -2317,6 +2680,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
     }
 
     function closeDrawer() {
+      activeDrawerConvId = null;
       document.getElementById('drawer-overlay').classList.remove('open');
       document.getElementById('trace-drawer').classList.remove('open');
     }
@@ -2327,6 +2691,10 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
 
     // CSV Export
     function exportLedgerCsv() {
+      if (vscode) {
+        vscode.postMessage({ command: 'exportCsv' });
+        return;
+      }
       const convs = DATA.conversations || [];
       const headers = ['Date', 'Conversation_ID', 'Project', 'Model', 'Turns', 'Fresh_Input', 'Cached_Context', 'Output', 'Thinking', 'Total_Tokens', 'Standard_Cost_USD', 'Cached_Cost_USD'];
       let csv = headers.join(',') + '\n';
@@ -2365,9 +2733,12 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
 
     function handleRefresh() {
       const btn = document.getElementById('refresh-btn');
+      const icon = document.getElementById('refresh-icon');
+      const label = document.getElementById('refresh-label');
       if (btn) {
-        btn.innerText = 'Scanning...';
         btn.disabled = true;
+        if (icon) icon.classList.add('spinning');
+        if (label) label.innerText = 'Scanning...';
       }
       if (vscode) {
         vscode.postMessage({ command: 'refresh' });
@@ -2387,7 +2758,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       renderWorkspacesTable();
       filterChats();
       if (activeDrawerConvId) {
-        renderDrawerContent(activeDrawerConvId);
+        openDrawer(activeDrawerConvId);
       }
     }
 
@@ -2415,9 +2786,35 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       if (message.command === 'updateData' && message.data) {
         DATA = message.data;
         updateUI();
+        const btn = document.getElementById('refresh-btn');
+        const icon = document.getElementById('refresh-icon');
+        const label = document.getElementById('refresh-label');
+        if (btn) {
+          btn.disabled = false;
+          if (icon) icon.classList.remove('spinning');
+          if (label) label.innerText = 'Refresh Data';
+        }
       }
     });
   </script>
+  <!-- Modal for Budget Guardrails -->
+  <div id="budget-modal" class="modal-overlay">
+    <div class="modal-card">
+      <h3>Configure Budget Guardrails</h3>
+      <div class="form-group">
+        <label>Daily Budget Cap (USD)</label>
+        <input type="number" step="0.50" min="0.10" id="budget-input-daily" value="5.00" />
+      </div>
+      <div class="form-group">
+        <label>Monthly Budget Cap (USD)</label>
+        <input type="number" step="1.00" min="1.00" id="budget-input-monthly" value="50.00" />
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="closeBudgetModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveBudgetFromModal()">Save Guardrails</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>
 '''
@@ -2466,6 +2863,7 @@ if __name__ == "__main__":
     parser.add_argument("--export-backup", metavar="FILE", help="Export full ledger backup to JSON")
     parser.add_argument("--import-backup", metavar="FILE", help="Restore ledger from JSON backup")
     parser.add_argument("--simulate-wipe", action="store_true", help="Simulate ~/.gemini deletion (tests disaster persistence)")
+    parser.add_argument("--rebuild", action="store_true", help="Force recalculate and rebuild ledger from raw transcripts")
     args = parser.parse_args()
     if args.data_dir:
         set_active_data_dir(args.data_dir)
@@ -2490,7 +2888,7 @@ if __name__ == "__main__":
         brain_to_use = "/tmp/mock_empty_brain_non_existent"
         print("⚠️  SIMULATION: Testing 100% disaster recovery with deleted ~/.gemini directory...")
 
-    results = merge_ledger_and_live(brain_path=brain_to_use)
+    results = merge_ledger_and_live(brain_path=brain_to_use, rebuild=args.rebuild)
     dash_path = generate_dashboard_html(results)
 
     if args.export_csv:
