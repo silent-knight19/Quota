@@ -1,61 +1,59 @@
-# 🚀 Quota — VS Code Marketplace Publishing Guide
+# 🚀 Quota — Marketplace & Distribution Publishing Guide (VS Code & Google Antigravity)
 
-This handbook walks you through publishing **Quota** to the Visual Studio Code Marketplace and Open VSX Registry in under 3 minutes.
-
----
-
-## 📋 Prerequisites
-- A free **Microsoft** or **GitHub** account.
-- The pre-built `.vsix` bundle: `quota-1.2.0.vsix` (already compiled and optimized at `~/Projects/antigravity-token-tracker/extension/quota-1.2.0.vsix`).
+This guide provides step-by-step instructions for publishing **Quota v1.2.1** to the **Visual Studio Code Marketplace** and deploying to **Google Antigravity IDE**.
 
 ---
 
-## 🛠️ Step 1: Create or Confirm Your Marketplace Publisher
+## 📋 Release Summary (v1.2.1)
+
+- **Package Artifact**: `quota-tracker-1.2.1.vsix` (~129 KB, 11 files)
+- **Publisher ID**: `SachinSingh`
+- **Extension Identifier**: `SachinSingh.quota-tracker`
+- **Highlights in v1.2.1**:
+  - ✨ **Pure Line Graph Timeline**: Redesigned Activity & Inference Timeline removing horizontal grid lines and bar blocks for a clean, unobstructed spline curve.
+  - 🔒 **CSPRNG Nonce-based CSP**: Zero `unsafe-inline` scripts; nonces injected dynamically on every webview load.
+  - 🛡️ **SQLite Concurrency & Authoritative Persistence**: Single-writer `InterProcessLock` with atomic `BEGIN IMMEDIATE` transactions and `ON CONFLICT(conv_id) DO UPDATE` UPSERTs.
+  - 💰 **Financial Correctness**: Fixed context-window precedence (`o1-mini` at 128k prioritized before `o1`) and isolated `GPT-4` commercial rate tracking from `GPT-4o`.
+  - 📦 **Sanitized CSV**: Native and fallback browser CSV exports hardened with formula neutralizing and quote escaping.
+
+---
+
+## 🛠️ Step 1: Package the VSIX Bundle
+
+Before publishing, build the optimized and verified `.vsix` archive:
+
+```bash
+cd ~/Projects/antigravity-token-tracker/extension
+./package_extension.sh
+```
+
+This compiles `quota-tracker-1.2.1.vsix` containing only runtime assets (`extension.js`, `tracker.py`, `dashboard.html`, `package.json`, `icon.png`), strictly excluding tests, databases, and telemetry.
+
+---
+
+## 🌐 Part A: Publishing to the Visual Studio Code Marketplace
+
+### Option 1: Web Management Portal (Easiest — 30 Seconds)
 
 1. Open the [Visual Studio Marketplace Management Portal](https://marketplace.visualstudio.com/manage).
-2. Sign in with your GitHub or Microsoft account.
-3. If you haven't created a publisher yet:
-   - Click **Create publisher**.
-   - **Publisher ID**: Enter your handle (e.g. `silent-knight19` or your preferred unique identifier).
-   - **Display Name**: Enter your name or company name (e.g. `Sachin Kumar Singh` or `Quota Team`).
-4. > [!NOTE]
-   > If your Publisher ID on the portal is different from `silent-knight19`, open `package.json` in the `extension/` directory and update the `"publisher"` field to match your ID, then run `./package_extension.sh`.
-
----
-
-## 🔑 Step 2: Generate an Azure DevOps Personal Access Token (PAT)
-
-1. Navigate to [Azure DevOps](https://dev.azure.com).
-2. Click your user avatar / settings icon in the top-right corner ⚙️ and select **Personal access tokens**.
-3. Click **+ New Token**.
-4. Configure the token fields:
-   - **Name**: `VSCode Marketplace Quota`
-   - **Organization**: Select **`All accessible organizations`** *(Critical: do NOT select a single org, or publish will fail)*.
-   - **Expiration**: `90 days` (or your preference).
-   - **Scopes**: Click **Show all scopes** at the bottom.
-   - Scroll down to **Marketplace** and check **`Manage`**.
-5. Click **Create** and **copy your token immediately** (it will not be shown again).
-
----
-
-## 📦 Step 3: Publish to the Store (Choose Option A or B)
-
-### Option A: Drag-and-Drop Web Upload (Easiest — 30 Seconds)
-
-1. Open [marketplace.visualstudio.com/manage](https://marketplace.visualstudio.com/manage).
-2. Click on your Publisher name.
-3. Click **+ New extension** → **Visual Studio Code**.
-4. Drag and drop the compiled **`quota-1.2.0.vsix`** file from:
+2. Sign in with your Microsoft / GitHub account.
+3. Locate **`SachinSingh`** (or your publisher handle).
+4. Click on **`quota-tracker`** (or click **+ New extension** → **Visual Studio Code** if publishing under a new publisher).
+5. Click **Update** (or upload button) and drag-and-drop:
    ```
-   ~/Projects/antigravity-token-tracker/extension/quota-1.2.0.vsix
+   ~/Projects/antigravity-token-tracker/extension/quota-tracker-1.2.1.vsix
    ```
-5. Marketplace verification will process the package within 2–3 minutes. Your extension is live!
+6. The marketplace will verify and publish the package automatically within 2–5 minutes.
 
 ---
 
-### Option B: One-Command CLI Publish
+### Option 2: Automated CLI Publish
 
-Run the automated publishing script with your Personal Access Token passed via environment variable:
+1. Generate a Personal Access Token (PAT) in [Azure DevOps](https://dev.azure.com):
+   - User Settings (⚙️ top right) → **Personal access tokens** → **+ New Token**.
+   - Organization: Select **`All accessible organizations`** *(Required)*.
+   - Scopes: Under **Marketplace**, check **`Manage`**.
+2. Run the secure publishing script:
 
 ```bash
 cd ~/Projects/antigravity-token-tracker/extension
@@ -63,23 +61,96 @@ export VSCE_PAT="<PASTE_YOUR_AZURE_DEVOPS_TOKEN_HERE>"
 ./publish_extension.sh
 ```
 
-The script will validate the package, authenticate with Microsoft using `VSCE_PAT`, and deploy directly to the marketplace without exposing the token in process arguments.
+The script verifies that `VSCE_PAT` is set in the environment and executes:
+```bash
+npx -y @vscode/vsce publish -p "$VSCE_PAT" --no-git-tag-version
+```
+*(No tokens are passed as command-line arguments, preventing shell history or process list exposure).*
 
 ---
 
-## 🌐 Step 4: Verify Your Live Listing
+## 🪐 Part B: Deploying to Google Antigravity IDE
 
-Once published, your extension will be accessible worldwide:
-- **Web Marketplace URL**:
-  `https://marketplace.visualstudio.com/items?itemName=<YOUR_PUBLISHER_ID>.quota`
-- **Inside VS Code**:
-  Open the Extensions panel (`Cmd + Shift + X` on Mac, `Ctrl + Shift + X` on Windows/Linux) and search for **`Quota`**.
+Google Antigravity IDE runs on the Code OSS / VS Code extension architecture. You can distribute Quota to Antigravity users through three pathways:
+
+### Pathway 1: Via the Visual Studio Code Marketplace (Recommended)
+Because Antigravity connects to the public extension ecosystem, publishing to the VS Code Marketplace (Part A above) automatically makes **Quota** searchable and installable directly inside Antigravity:
+1. Open Antigravity IDE.
+2. Press `Cmd + Shift + X` (Mac) or `Ctrl + Shift + X` (Windows/Linux) to open the Extensions panel.
+3. Search for **`Quota`** and click **Install**.
+
+---
+
+### Pathway 2: Direct VSIX Sideloading (Offline & Instant)
+
+For air-gapped workstations or immediate team distribution:
+
+#### In the Antigravity UI:
+1. Open Antigravity IDE.
+2. Open the Extensions view (`Cmd+Shift+X` / `Ctrl+Shift+X`).
+3. Click the `...` menu (Views and More Actions) at the top right of the Extensions panel.
+4. Select **Install from VSIX...**
+5. Choose `quota-tracker-1.2.1.vsix` located at:
+   ```
+   ~/Projects/antigravity-token-tracker/extension/quota-tracker-1.2.1.vsix
+   ```
+
+#### Via Antigravity CLI:
+```bash
+# If 'agy' or 'antigravity' is in your PATH:
+agy --install-extension ~/Projects/antigravity-token-tracker/extension/quota-tracker-1.2.1.vsix
+
+# Or using the standard code CLI:
+code --install-extension ~/Projects/antigravity-token-tracker/extension/quota-tracker-1.2.1.vsix
+```
+
+---
+
+### Pathway 3: Developer Live Link (Instant Local Development)
+
+To link your live workspace code directly into Antigravity IDE without rebuilding `.vsix`:
+
+```bash
+cd ~/Projects/antigravity-token-tracker
+./install_extension.sh
+```
+
+This script automatically creates clean symlinks in:
+- `~/.antigravity-ide/extensions/SachinSingh.quota-tracker-1.2.1`
+- `~/.antigravity/extensions/SachinSingh.quota-tracker-1.2.1`
+- `~/.vscode/extensions/SachinSingh.quota-tracker-1.2.1`
+
+Then press `Cmd + Shift + P` inside Antigravity IDE and run **`Developer: Reload Window`**.
+
+---
+
+### Pathway 4: Open VSX Registry (For Open-Source IDE Distributions)
+
+If your team or community uses VSCodium, Gitpod, or custom Open VSX-configured Antigravity forks:
+
+1. Create an account at [open-vsx.org](https://open-vsx.org) and generate an Access Token.
+2. Publish with:
+```bash
+npx -y ovsx publish ~/Projects/antigravity-token-tracker/extension/quota-tracker-1.2.1.vsix -p "<YOUR_OVSX_TOKEN>"
+```
+
+---
+
+## 🔍 Step 3: Verify Live Deployment
+
+Once published, verify the installation:
+
+| Platform | Verification Action | Expected State |
+|---|---|---|
+| **Marketplace** | Visit `https://marketplace.visualstudio.com/items?itemName=SachinSingh.quota-tracker` | Shows v1.2.1 with updated feature notes |
+| **VS Code** | Search `Quota` in Extensions panel | Version `1.2.1` available for install/update |
+| **Google Antigravity** | Run `Quota: Open Quota Dashboard` (`Cmd+Shift+P`) | Clean line-graph Activity Timeline loads with status bar pill |
 
 ---
 
 ## 🔄 Publishing Future Updates
 
-Whenever you make improvements or bump the version:
-1. Update `"version"` in `extension/package.json` (e.g. `1.2.1`).
-2. Run `./package_extension.sh` to compile the new `.vsix`.
-3. Run `export VSCE_PAT="<TOKEN>" && ./publish_extension.sh` (or drag-and-drop the new `.vsix` on the management portal).
+1. Update `"version"` in `extension/package.json` (e.g. `1.2.2`).
+2. Add release highlights to `CHANGELOG.md`.
+3. Run `./extension/package_extension.sh`.
+4. Run `export VSCE_PAT="<PAT>" && ./extension/publish_extension.sh`.

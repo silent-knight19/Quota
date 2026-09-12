@@ -25,8 +25,8 @@
   - **Prompt-Cached Real Cost**: Actual cost with Gemini/Anthropic prompt caching discounts applied.
   - **Autonomous Invocations**: Total AI turns, sessions, and workspaces tracked.
 - **Continuous 30-Day Activity & Inference Timeline**:
-  - Smooth Catmull-Rom cubic spline area curve with glowing neon gradient fill.
-  - Slim column bars with interactive hover crosshairs and tooltips.
+  - Uncluttered, pure line graph design powered by monotone cubic spline interpolation.
+  - Glowing neon gradient area fill with interactive hover crosshairs and live metric tooltips.
   - Filter by range (`14D`, `30D`, `All History`) and metric (`Commercial Cost ($)`, `Token Volume`, `Invocations`).
 - **Token Distribution Layer**: Segmented visual breakdown of Prompt Cache, Fresh Ingestion, Model Output, Chain-of-Thought Thinking, and Tool Calls.
 - **Provider & Model Matrix**: Telemetry across Gemini 3.5/3.6/3.7/3.8 Flash, Gemini 3.1 Pro, Claude Sonnet 4.6, and Claude Opus 4.6.
@@ -51,8 +51,8 @@ Quota was engineered from the ground up to comply with strict enterprise securit
 - **100% Local & Offline**: Zero external network calls. All charts, icons, and fonts are embedded locally with zero remote CDN dependencies.
 - **Zero Content Retention**: Quota **never** reads, copies, or stores raw source code, proprietary algorithms, or user prompts. Only anonymous numerical counters (token quantities and costs) are retained.
 - **Zero Shell Injection**: All process executions use strict `child_process.execFile` with isolated argument arrays. Subshell invocation (`/bin/sh` or `cmd.exe`) is completely eliminated.
-- **Strict Content Security Policy (CSP)**: The visual cockpit operates under an explicit `Content-Security-Policy` prohibiting any external script or stylesheet injection.
-- **Safe Database Concurrency**: SQLite runs with Write-Ahead Logging (`WAL` mode) and busy timeouts to prevent database locks across multiple concurrent windows.
+- **Strict Content Security Policy (CSP)**: The visual cockpit operates under an explicit `Content-Security-Policy` with cryptographic nonces prohibiting any external script or stylesheet injection.
+- **Safe Database Concurrency**: Single-writer SQLite architecture using OS-level advisory file locks (`.scan.lock`), explicit `BEGIN IMMEDIATE` transactions, and atomic UPSERTs (`ON CONFLICT(conv_id) DO UPDATE`) to ensure zero lost updates across concurrent IDE windows and scanner invocations.
 
 ---
 

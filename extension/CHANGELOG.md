@@ -2,6 +2,32 @@
 
 All notable changes to the "Quota" extension will be documented in this file.
 
+## [1.2.1] - Production Hardening & UI Polish Release
+
+### Changed & Improved
+- **Clean Line Graph Timeline Redesign**:
+  - Redesigned the **Activity & Inference Timeline** into an unobstructed, pure line graph.
+  - Removed cluttering horizontal grid lines and bar blocks across all metric views.
+  - Preserved the glowing monotone cubic spline curve, area gradient fill, interactive hover crosshairs, and live metric tooltips.
+- **Enterprise Concurrency & SQLite Single-Writer Persistence**:
+  - Implemented OS-safe file locking (`InterProcessLock`) on `~/.config/quota/.scan.lock`.
+  - Enforced atomic `BEGIN IMMEDIATE` write transactions and `INSERT ... ON CONFLICT(conv_id) DO UPDATE` UPSERT semantics, completely preventing lost-update anomalies during concurrent multi-process scans.
+  - Inactive session attribution now strictly verifies physical directory absence on disk before marking records inactive.
+- **Strict Content Security Policy & Webview Hardening**:
+  - Enforced strict CSP `script-src 'nonce-<TOKEN>'` with cryptographically random CSPRNG nonces generated on every webview load (`secrets.token_urlsafe(16)` in Python and `crypto.randomBytes(16)` in Node.js).
+  - Completely eliminated `script-src 'unsafe-inline'` and removed all inline HTML event handler attributes (`onclick`, `onchange`, `oninput`, `onmouseenter`, `onmouseleave`) in favor of declarative DOM `addEventListener` bindings.
+- **Financial & Model Intelligence Accuracy**:
+  - Resolved model context-window precedence bug where `o1` shadowed `o1-mini`. Specific model prefixes (`o1-mini` at 128k, `o3-mini` at 200k) now evaluate before generic short tokens.
+  - Disambiguated generic `gpt-4` from `gpt-4o`. `GPT-4` is now assigned dedicated canonical commercial rates ($30.00 / $60.00 per 1M tokens), preventing severe cost under-reporting.
+- **Hardened CSV Export & Formula Injection Defense**:
+  - Implemented RFC 4180-compliant formula neutralizing and quote-doubling escaping (`csvCell()`) across both native VS Code and browser fallback export pathways.
+- **Publishing & Secret Security**:
+  - Updated `publish_extension.sh` to enforce authentication strictly via `VSCE_PAT` environment variable; positional CLI arguments are rejected to prevent token leakage in process tables, shell history, and logs.
+- **Architecture & Source Parity**:
+  - Refactored background scanning in the extension host to single-flight Promise coalescing (`activeScanPromise`, `scanRequestedAgain`), ensuring at most one child process runs at any time.
+  - Replaced 1,800-line embedded HTML string in `tracker.py` with canonical file-based template loading.
+  - Enforced byte-for-byte parity between root and extension runtime files with automated SHA-256 integrity tests.
+
 ## [1.2.0] - Initial Public Release
 
 ### Added
