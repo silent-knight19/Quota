@@ -55,14 +55,15 @@ This handbook walks you through publishing **Quota** to the Visual Studio Code M
 
 ### Option B: One-Command CLI Publish
 
-Run the automated publishing script from your terminal:
+Run the automated publishing script with your Personal Access Token passed via environment variable:
 
 ```bash
 cd ~/Projects/antigravity-token-tracker/extension
-./publish_extension.sh <PASTE_YOUR_AZURE_DEVOPS_TOKEN_HERE>
+export VSCE_PAT="<PASTE_YOUR_AZURE_DEVOPS_TOKEN_HERE>"
+./publish_extension.sh
 ```
 
-The script will validate the package, authenticate with Microsoft, and deploy directly to the marketplace.
+The script will validate the package, authenticate with Microsoft using `VSCE_PAT`, and deploy directly to the marketplace without exposing the token in process arguments.
 
 ---
 
@@ -81,4 +82,4 @@ Once published, your extension will be accessible worldwide:
 Whenever you make improvements or bump the version:
 1. Update `"version"` in `extension/package.json` (e.g. `1.2.1`).
 2. Run `./package_extension.sh` to compile the new `.vsix`.
-3. Run `./publish_extension.sh <TOKEN>` (or drag-and-drop the new `.vsix` on the management portal).
+3. Run `export VSCE_PAT="<TOKEN>" && ./publish_extension.sh` (or drag-and-drop the new `.vsix` on the management portal).

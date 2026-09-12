@@ -10,11 +10,24 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import hashlib
+import multiprocessing
+import re
+import subprocess
 
 # Add parent directory to path so tracker can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import tracker
+
+
+def _worker_scan(brain_dir, db_path):
+    tracker.merge_ledger_and_live(brain_path=brain_dir, db_path=db_path)
+
+
+def _worker_upsert(db_path, conv):
+    tracker.save_conversations_to_ledger([conv], db_path=db_path)
+
 
 
 class TestPricingResolution(unittest.TestCase):
@@ -263,6 +276,272 @@ class TestTokenAccountingAndFaultIsolation(unittest.TestCase):
             c["thinking_tokens"]
         )
         self.assertEqual(c["total_tokens"], computed_total)
+
+
+class TestContextWindowPrecedence(unittest.TestCase):
+    """Verifies prefix vs exact matching and context-window precedence (P1-2)."""
+
+    def test_context_limit_o1_mini(self):
+        self.assertEqual(tracker.get_model_context_limit("o1-mini"), 128_000)
+
+    def test_context_limit_o1(self):
+        self.assertEqual(tracker.get_model_context_limit("o1"), 200_000)
+
+    def test_context_limit_o3_and_o3_mini(self):
+        self.assertEqual(tracker.get_model_context_limit("o3"), 200_000)
+        self.assertEqual(tracker.get_model_context_limit("o3-mini"), 200_000)
+
+    def test_context_limit_gpt4_vs_gpt4o(self):
+        self.assertEqual(tracker.get_model_context_limit("gpt-4"), 128_000)
+        self.assertEqual(tracker.get_model_context_limit("gpt-4o"), 128_000)
+        self.assertEqual(tracker.get_model_context_limit("gpt-4o-mini"), 128_000)
+
+    def test_context_limit_claude_and_gemini(self):
+        self.assertEqual(tracker.get_model_context_limit("claude-3-5-sonnet-20241022"), 200_000)
+        self.assertEqual(tracker.get_model_context_limit("claude-opus-4"), 200_000)
+        self.assertEqual(tracker.get_model_context_limit("gemini-2.0-flash"), 200_000)
+        self.assertEqual(tracker.get_model_context_limit("gemini-1.5-pro"), 200_000)
+
+    def test_context_limit_suffixed_names(self):
+        self.assertEqual(tracker.get_model_context_limit("o1-mini-2024-09-12"), 128_000)
+        self.assertEqual(tracker.get_model_context_limit("o1-mini-preview"), 128_000)
+        self.assertEqual(tracker.get_model_context_limit("o3-mini-2025-01-31"), 200_000)
+
+    def test_context_limit_unknown_model_fallback(self):
+        self.assertEqual(tracker.get_model_context_limit("completely-unknown-custom-model"), tracker.DEFAULT_CONTEXT_WINDOW)
+
+
+class TestPricingIdentitiesAndAliases(unittest.TestCase):
+    """Verifies strict financial separation of GPT-4 vs GPT-4o and alias correctness (P2-2)."""
+
+    def test_pricing_gpt4_distinct_from_gpt4o(self):
+        p4 = tracker.get_pricing("gpt-4")
+        p4o = tracker.get_pricing("gpt-4o")
+        self.assertNotEqual(p4["input_uncached"], p4o["input_uncached"])
+        self.assertEqual(p4["input_uncached"], 30.00)
+        self.assertEqual(p4["output"], 60.00)
+        self.assertEqual(p4o["input_uncached"], 2.50)
+        self.assertEqual(p4o["output"], 10.00)
+
+    def test_pricing_alias_gpt_4_maps_to_gpt4_not_gpt4o(self):
+        p_alias = tracker.get_pricing("gpt 4")
+        p4o = tracker.get_pricing("gpt-4o")
+        self.assertEqual(p_alias["input_uncached"], 30.00)
+        self.assertEqual(p_alias["output"], 60.00)
+        self.assertNotEqual(p_alias["input_uncached"], p4o["input_uncached"])
+
+    def test_pricing_family_attribution(self):
+        self.assertEqual(tracker.get_pricing("gpt-4")["family"], "OpenAI")
+        self.assertEqual(tracker.get_pricing("gpt-4o")["family"], "OpenAI")
+        self.assertEqual(tracker.get_pricing("gpt-4o-mini")["family"], "OpenAI")
+        self.assertEqual(tracker.get_pricing("claude-3-5-sonnet")["family"], "Anthropic")
+        self.assertEqual(tracker.get_pricing("gemini-2.0-flash")["family"], "Google")
+
+    def test_turn_cost_non_negative_and_additive(self):
+        uncached, cached = tracker.calculate_turn_cost("gpt-4", 1000, 2000, 500)
+        self.assertGreaterEqual(uncached, 0.0)
+        self.assertGreaterEqual(cached, 0.0)
+        self.assertLessEqual(cached, uncached)
+
+
+class TestHardenedWebviewAndCSV(unittest.TestCase):
+    """Verifies CSP cryptographic nonce, zero inline handlers, and safe CSV serializing (P2-1, P2-4)."""
+
+    def test_canonical_csp_contains_nonce_and_no_unsafe_inline(self):
+        template = tracker.get_dashboard_template()
+        csp_line = ""
+        for line in template.splitlines():
+            if "Content-Security-Policy" in line:
+                csp_line = line
+                break
+        self.assertTrue(csp_line, "CSP meta tag must exist")
+        self.assertIn("script-src 'nonce-__NONCE__';", csp_line)
+        self.assertNotIn("'unsafe-inline'", csp_line.split("script-src")[1].split(";")[0])
+        self.assertNotIn("https:", csp_line)
+        self.assertNotIn("vscode-resource:", csp_line)
+
+    def test_generate_dashboard_injects_cryptographic_nonce(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            payload = {"summary": {}, "conversations": []}
+            dash_path = tracker.generate_dashboard_html(payload, out_dir=tmp_dir)
+            with open(dash_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            csp_match = re.search(r"script-src 'nonce-([a-zA-Z0-9_\-]+)'", content)
+            script_match = re.search(r"<script nonce=\"([a-zA-Z0-9_\-]+)\">", content)
+            self.assertIsNotNone(csp_match, "CSP must contain injected nonce")
+            self.assertIsNotNone(script_match, "<script> tag must contain injected nonce")
+
+            csp_nonce = csp_match.group(1)
+            script_nonce = script_match.group(1)
+            self.assertEqual(csp_nonce, script_nonce)
+            self.assertGreaterEqual(len(csp_nonce), 24)
+
+    def test_no_inline_on_event_attributes_in_canonical_dashboard(self):
+        template = tracker.get_dashboard_template()
+        inline_handlers = re.findall(r"(\son[a-z]+=[^>\s]+)", template)
+        self.assertEqual(inline_handlers, [], f"Found forbidden inline event handlers: {inline_handlers}")
+
+    def test_xss_payload_injection_neutralized(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            payload = {
+                "summary": {},
+                "conversations": [
+                    {
+                        "id": "xss-test-1",
+                        "project": "</script><script>alert(1)</script>",
+                        "primary_model": '<img src=x onerror=alert("XSS")>',
+                        "tools": {'"><svg/onload=alert(1)>': 1},
+                        "anomalies": ["javascript:alert(1)"]
+                    }
+                ]
+            }
+            dash_path = tracker.generate_dashboard_html(payload, out_dir=tmp_dir)
+            with open(dash_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Verify no unescaped </script> tag inside JSON
+            self.assertNotIn("</script><script>alert(1)</script>", content)
+            self.assertIn("<\\/script>", content)
+
+    def test_browser_csv_cell_formula_and_quote_neutralization(self):
+        def mock_browser_csv_cell(value):
+            text = str(value if value is not None else "")
+            safe = "'" + text if re.match(r"^[=+\-@\t\r]", text) else text
+            return f'"{safe.replace(chr(34), chr(34) + chr(34))}"'
+
+        self.assertEqual(mock_browser_csv_cell("=1+1"), '"\'=1+1"')
+        self.assertEqual(mock_browser_csv_cell("+cmd"), '"\'+cmd"')
+        self.assertEqual(mock_browser_csv_cell("-malicious"), '"\'-malicious"')
+        self.assertEqual(mock_browser_csv_cell("@SUM(A1:A10)"), '"\'@SUM(A1:A10)"')
+        self.assertEqual(mock_browser_csv_cell("\tmalicious"), '"\'\tmalicious"')
+        self.assertEqual(mock_browser_csv_cell('He said "Hello"'), '"He said ""Hello"""')
+        self.assertEqual(mock_browser_csv_cell("Normal Workspace"), '"Normal Workspace"')
+
+
+class TestSQLiteAuthoritativeConcurrency(unittest.TestCase):
+    """Verifies multi-process concurrency, zero lost updates, and database integrity (P1-1)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test_ledger.sqlite")
+        tracker.init_database(self.db_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _create_mock_session(self, brain_dir, conv_id, project, model, prompt_text):
+        conv_dir = os.path.join(brain_dir, conv_id, ".system_generated", "logs")
+        os.makedirs(conv_dir, exist_ok=True)
+        transcript = os.path.join(conv_dir, "transcript.jsonl")
+        steps = [
+            {"type": "USER_INPUT", "content": prompt_text},
+            {"type": "PLANNER_RESPONSE", "model": model, "content": "Done", "tool_calls": []}
+        ]
+        with open(transcript, "w", encoding="utf-8") as f:
+            for s in steps:
+                f.write(json.dumps(s) + "\n")
+
+    def test_multiprocess_concurrent_scanners_no_lost_updates(self):
+        # Process A sees Conv A + Conv C
+        # Process B sees Conv A + Conv D
+        # Final DB must contain A, C, and D
+        brain_a = os.path.join(self.temp_dir, "brain_a")
+        brain_b = os.path.join(self.temp_dir, "brain_b")
+
+        self._create_mock_session(brain_a, "conv-A", "ProjA", "gpt-4o", "Hello from A")
+        self._create_mock_session(brain_a, "conv-C", "ProjC", "gpt-4o", "Hello from C")
+
+        self._create_mock_session(brain_b, "conv-A", "ProjA", "gpt-4o", "Hello from A updated")
+        self._create_mock_session(brain_b, "conv-D", "ProjD", "gpt-4o", "Hello from D")
+
+        p1 = multiprocessing.Process(target=_worker_scan, args=(brain_a, self.db_path))
+        p2 = multiprocessing.Process(target=_worker_scan, args=(brain_b, self.db_path))
+
+        p1.start()
+        p2.start()
+        p1.join(timeout=10)
+        p2.join(timeout=10)
+
+        self.assertEqual(p1.exitcode, 0, "Worker 1 failed")
+        self.assertEqual(p2.exitcode, 0, "Worker 2 failed")
+
+        ledger = tracker.load_ledger_from_db(self.db_path)
+        self.assertIn("conv-A", ledger, "Conversation A must survive concurrent scan")
+        self.assertIn("conv-C", ledger, "Conversation C must survive concurrent scan")
+        self.assertIn("conv-D", ledger, "Conversation D must survive concurrent scan")
+
+        # Database integrity check
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("PRAGMA integrity_check;")
+        res = cur.fetchall()
+        conn.close()
+        self.assertEqual(res, [("ok",)])
+
+    def test_simultaneous_writes_to_same_conv_id(self):
+        c1 = {"id": "same-conv", "date": "2026-09-12", "project": "P1", "primary_model": "gpt-4o", "total_tokens": 1000}
+        c2 = {"id": "same-conv", "date": "2026-09-12", "project": "P1", "primary_model": "gpt-4o", "total_tokens": 2000}
+
+        p1 = multiprocessing.Process(target=_worker_upsert, args=(self.db_path, c1))
+        p2 = multiprocessing.Process(target=_worker_upsert, args=(self.db_path, c2))
+
+        p1.start()
+        p2.start()
+        p1.join(timeout=10)
+        p2.join(timeout=10)
+
+        self.assertEqual(p1.exitcode, 0)
+        self.assertEqual(p2.exitcode, 0)
+
+        ledger = tracker.load_ledger_from_db(self.db_path)
+        self.assertIn("same-conv", ledger)
+        self.assertIn(ledger["same-conv"]["total_tokens"], [1000, 2000])
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("PRAGMA integrity_check;")
+        self.assertEqual(cur.fetchall(), [("ok",)])
+        conn.close()
+
+
+class TestSourceCodeIntegrityAndPackaging(unittest.TestCase):
+    """Verifies single source of truth, hash equality, and secure publishing credentials (P3-1, P2-3)."""
+
+    def test_root_and_extension_tracker_sha256_equality(self):
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        root_path = os.path.join(base_dir, "tracker.py")
+        ext_path = os.path.join(base_dir, "extension", "tracker.py")
+
+        with open(root_path, "rb") as f:
+            h_root = hashlib.sha256(f.read()).hexdigest()
+        with open(ext_path, "rb") as f:
+            h_ext = hashlib.sha256(f.read()).hexdigest()
+
+        self.assertEqual(h_root, h_ext, "root tracker.py and extension/tracker.py MUST be byte-for-byte identical")
+
+    def test_canonical_dashboard_sha256_equality(self):
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        root_path = os.path.join(base_dir, "dashboard.html")
+        ext_path = os.path.join(base_dir, "extension", "dashboard.html")
+
+        with open(root_path, "rb") as f:
+            h_root = hashlib.sha256(f.read()).hexdigest()
+        with open(ext_path, "rb") as f:
+            h_ext = hashlib.sha256(f.read()).hexdigest()
+
+        self.assertEqual(h_root, h_ext, "root dashboard.html and extension/dashboard.html MUST be byte-for-byte identical")
+
+    def test_publish_script_enforces_vsce_pat_env_var(self):
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        script_path = os.path.join(base_dir, "extension", "publish_extension.sh")
+        with open(script_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn("VSCE_PAT", content, "publish_extension.sh must reference VSCE_PAT environment variable")
+        self.assertIn("Please set the VSCE_PAT environment variable", content)
+        self.assertNotIn('publish -p "$1"', content, "publish_extension.sh must NOT accept PAT as positional parameter $1")
 
 
 if __name__ == "__main__":

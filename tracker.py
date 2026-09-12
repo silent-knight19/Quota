@@ -16,8 +16,50 @@ import calendar
 import sqlite3
 import shutil
 import argparse
+import time
+import secrets
+import hashlib
 from datetime import datetime
 from collections import defaultdict
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+class InterProcessLock:
+    """OS-level advisory file lock with timeout for cross-process synchronization."""
+    def __init__(self, lock_path=None, timeout=30.0):
+        self.lock_path = lock_path or os.path.join(DATA_DIR, ".scan.lock")
+        self.timeout = timeout
+        self.fd = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(os.path.abspath(self.lock_path)), exist_ok=True)
+        self.fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR)
+        start_time = time.time()
+        while True:
+            try:
+                if fcntl and hasattr(fcntl, "flock"):
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except (BlockingIOError, OSError):
+                if time.time() - start_time >= self.timeout:
+                    raise TimeoutError(f"Timed out waiting for scan lock: {self.lock_path}")
+                time.sleep(0.05)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.fd is not None:
+            try:
+                if fcntl and hasattr(fcntl, "flock"):
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            self.fd = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if sys.platform == "win32":
@@ -142,6 +184,13 @@ PRICING_TABLE = {
         "input_cached_read": 0.01875,
         "output": 0.30,
         "thinking": 0.30,
+    },
+    "GPT-4": {
+        "family": "OpenAI",
+        "input_uncached": 30.00,
+        "input_cached_read": 15.00,
+        "output": 60.00,
+        "thinking": 60.00,
     },
     "GPT-4o": {
         "family": "OpenAI",
@@ -276,12 +325,63 @@ CONTEXT_WINDOW_LIMITS = {
     "o1-mini": 128_000,
     "Default": 200_000,
 }
+DEFAULT_CONTEXT_WINDOW = CONTEXT_WINDOW_LIMITS["Default"]
+
+def calculate_turn_cost(model_name: str, fresh_in: int, cached_in: int, out_tok: int, tool_tok: int = 0, thk_tok: int = 0) -> tuple:
+    """Calculate standard (uncached) and prompt-cached commercial cost for a single turn."""
+    pricing = get_pricing(model_name)
+    total_in = fresh_in + cached_in
+    billed_out = out_tok + tool_tok
+    cost_uncached = (
+        (total_in / 1_000_000.0) * pricing["input_uncached"] +
+        (billed_out / 1_000_000.0) * pricing["output"] +
+        (thk_tok / 1_000_000.0) * pricing["thinking"]
+    )
+    cost_cached = (
+        (fresh_in / 1_000_000.0) * pricing["input_uncached"] +
+        (cached_in / 1_000_000.0) * pricing["input_cached_read"] +
+        (billed_out / 1_000_000.0) * pricing["output"] +
+        (thk_tok / 1_000_000.0) * pricing["thinking"]
+    )
+    return cost_uncached, cost_cached
 
 def get_model_context_limit(model_name: str) -> int:
-    name_low = (model_name or "").lower()
-    for prefix, limit in CONTEXT_WINDOW_LIMITS.items():
-        if prefix.lower() in name_low:
+    if not model_name:
+        return CONTEXT_WINDOW_LIMITS["Default"]
+    name_low = model_name.strip().lower()
+    norm = normalize_model_str(model_name)
+
+    # Sub-tier tokens checked first to prevent shadowing (e.g. o1-mini before o1)
+    if "o1 mini" in norm or "o1-mini" in name_low:
+        return CONTEXT_WINDOW_LIMITS["o1-mini"]
+    if "o3 mini" in norm or "o3-mini" in name_low:
+        return CONTEXT_WINDOW_LIMITS["o3-mini"]
+    if "gpt 4o mini" in norm or "gpt-4o-mini" in name_low:
+        return CONTEXT_WINDOW_LIMITS["GPT-4o"]
+    if "gpt 4o" in norm or "gpt-4o" in name_low:
+        return CONTEXT_WINDOW_LIMITS["GPT-4o"]
+    if "gpt 4" in norm or "gpt-4" in name_low:
+        return CONTEXT_WINDOW_LIMITS["GPT-4"]
+    if "o1" in norm.split() or name_low.startswith("o1"):
+        return CONTEXT_WINDOW_LIMITS["o1"]
+    if "o3" in norm.split() or name_low.startswith("o3"):
+        return CONTEXT_WINDOW_LIMITS["o3"]
+    if "claude" in norm:
+        return CONTEXT_WINDOW_LIMITS["Claude"]
+    if "gemini" in norm:
+        return CONTEXT_WINDOW_LIMITS["Gemini"]
+
+    # Fallback to longest-key-first match
+    candidates = sorted(
+        [(k, v) for k, v in CONTEXT_WINDOW_LIMITS.items() if k != "Default"],
+        key=lambda item: len(item[0]),
+        reverse=True
+    )
+    for prefix, limit in candidates:
+        p_low = prefix.lower()
+        if p_low in name_low or normalize_model_str(prefix) in norm:
             return limit
+
     return CONTEXT_WINDOW_LIMITS["Default"]
 
 def estimate_tokens(text: str) -> int:
@@ -295,8 +395,11 @@ def normalize_model_str(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
 PRICING_ALIASES = {
+    "gpt 4": "GPT-4",
+    "gpt 4 0314": "GPT-4",
+    "gpt 4 0613": "GPT-4",
+    "gpt 4 32k": "GPT-4",
     "gpt 4o": "GPT-4o",
-    "gpt 4": "GPT-4o",
     "gpt 4o mini": "GPT-4o-mini",
     "o1": "o1",
     "o1 mini": "o1-mini",
@@ -345,6 +448,10 @@ def get_pricing(model_name: str) -> dict:
         return PRICING_TABLE["o3-mini"]
     if "gpt 4o mini" in norm or "gpt-4o-mini" in name_low:
         return PRICING_TABLE["GPT-4o-mini"]
+    if "gpt 4o" in norm or "gpt-4o" in name_low:
+        return PRICING_TABLE["GPT-4o"]
+    if "gpt 4" in norm or "gpt-4" in name_low:
+        return PRICING_TABLE["GPT-4"]
     if "haiku" in norm:
         return PRICING_TABLE["Claude 3.5 Haiku"]
     if "flash" in norm:
@@ -369,8 +476,6 @@ def get_pricing(model_name: str) -> dict:
         return PRICING_TABLE["o1"]
     if "o3" in norm.split():
         return PRICING_TABLE["o3"]
-    if "gpt 4o" in norm or "gpt 4" in norm:
-        return PRICING_TABLE["GPT-4o"]
     if "pro" in norm and ("gemini" in norm or "google" in norm):
         if "1 5" in norm:
             return PRICING_TABLE["Gemini 1.5 Pro"]
@@ -559,54 +664,62 @@ def save_conversations_to_ledger(conversations_list, db_path=None):
     conn = get_db_connection(target_path)
     now_str = datetime.utcnow().isoformat() + "Z"
     try:
-        with conn:
-            cur = conn.cursor()
-            for c in conversations_list:
-                models_json = json.dumps(c.get("models") or [c.get("primary_model")])
-                tools_json = json.dumps(c.get("tools") or {})
-                trace_json = json.dumps(c.get("trace") or [])
-                anomaly_json = json.dumps(c.get("anomalies") or [])
-                daily_breakdown_json = json.dumps(c.get("daily_breakdown") or {})
-                first_date = str(c.get("first_date") or c.get("date") or "")
-                
-                cur.execute('''INSERT INTO conversations_ledger (
-                    conv_id, date, project, primary_model, models_json,
-                    fresh_input_tokens, cached_context_tokens, output_tokens, thinking_tokens, tool_call_tokens,
-                    total_tokens, cost_uncached_usd, cost_cached_usd, invocations,
-                    first_seen_at, last_updated_at, is_active, tools_json, trace_json, anomaly_json,
-                    daily_breakdown_json, first_date
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(conv_id) DO UPDATE SET
-                    date = excluded.date,
-                    project = excluded.project,
-                    primary_model = excluded.primary_model,
-                    models_json = excluded.models_json,
-                    fresh_input_tokens = excluded.fresh_input_tokens,
-                    cached_context_tokens = excluded.cached_context_tokens,
-                    output_tokens = excluded.output_tokens,
-                    thinking_tokens = excluded.thinking_tokens,
-                    tool_call_tokens = excluded.tool_call_tokens,
-                    total_tokens = excluded.total_tokens,
-                    cost_uncached_usd = excluded.cost_uncached_usd,
-                    cost_cached_usd = excluded.cost_cached_usd,
-                    invocations = excluded.invocations,
-                    last_updated_at = excluded.last_updated_at,
-                    is_active = excluded.is_active,
-                    tools_json = excluded.tools_json,
-                    trace_json = excluded.trace_json,
-                    anomaly_json = excluded.anomaly_json,
-                    daily_breakdown_json = excluded.daily_breakdown_json,
-                    first_date = excluded.first_date
-                ''', (
-                    c["id"], c["date"], c["project"], c["primary_model"], models_json,
-                    c.get("fresh_input_tokens", 0), c.get("cached_context_tokens", 0),
-                    c.get("output_tokens", 0), c.get("thinking_tokens", 0), c.get("tool_call_tokens", 0),
-                    c.get("total_tokens", 0), c.get("cost_uncached_usd", 0.0), c.get("cost_cached_usd", 0.0),
-                    c.get("invocations", 0), now_str, now_str, c.get("is_active", 1),
-                    tools_json, trace_json, anomaly_json, daily_breakdown_json, first_date
-                ))
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        for c in conversations_list:
+            models_json = json.dumps(c.get("models") or [c.get("primary_model")])
+            tools_json = json.dumps(c.get("tools") or {})
+            trace_json = json.dumps(c.get("trace") or [])
+            anomaly_json = json.dumps(c.get("anomalies") or [])
+            daily_breakdown_json = json.dumps(c.get("daily_breakdown") or {})
+            first_date = str(c.get("first_date") or c.get("date") or "")
+            first_seen = c.get("first_seen_at") or now_str
             
-            cur.execute('''INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_sync', ?)''', (now_str,))
+            cur.execute('''INSERT INTO conversations_ledger (
+                conv_id, date, project, primary_model, models_json,
+                fresh_input_tokens, cached_context_tokens, output_tokens, thinking_tokens, tool_call_tokens,
+                total_tokens, cost_uncached_usd, cost_cached_usd, invocations,
+                first_seen_at, last_updated_at, is_active, tools_json, trace_json, anomaly_json,
+                daily_breakdown_json, first_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(conv_id) DO UPDATE SET
+                date = excluded.date,
+                project = excluded.project,
+                primary_model = excluded.primary_model,
+                models_json = excluded.models_json,
+                fresh_input_tokens = excluded.fresh_input_tokens,
+                cached_context_tokens = excluded.cached_context_tokens,
+                output_tokens = excluded.output_tokens,
+                thinking_tokens = excluded.thinking_tokens,
+                tool_call_tokens = excluded.tool_call_tokens,
+                total_tokens = excluded.total_tokens,
+                cost_uncached_usd = excluded.cost_uncached_usd,
+                cost_cached_usd = excluded.cost_cached_usd,
+                invocations = excluded.invocations,
+                last_updated_at = excluded.last_updated_at,
+                is_active = excluded.is_active,
+                tools_json = excluded.tools_json,
+                trace_json = excluded.trace_json,
+                anomaly_json = excluded.anomaly_json,
+                daily_breakdown_json = excluded.daily_breakdown_json,
+                first_date = excluded.first_date
+            ''', (
+                c["id"], c["date"], c["project"], c["primary_model"], models_json,
+                c.get("fresh_input_tokens", 0), c.get("cached_context_tokens", 0),
+                c.get("output_tokens", 0), c.get("thinking_tokens", 0), c.get("tool_call_tokens", 0),
+                c.get("total_tokens", 0), c.get("cost_uncached_usd", 0.0), c.get("cost_cached_usd", 0.0),
+                c.get("invocations", 0), first_seen, now_str, c.get("is_active", 1),
+                tools_json, trace_json, anomaly_json, daily_breakdown_json, first_date
+            ))
+        
+        cur.execute('''INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_sync', ?)''', (now_str,))
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         conn.close()
 
@@ -901,31 +1014,91 @@ def scan_live_brain(brain_path=None) -> tuple:
 def merge_ledger_and_live(brain_path=None, db_path=None, rebuild=False) -> dict:
     target_brain = brain_path or BRAIN_DIR
     target_db = db_path or DB_PATH
-    if rebuild:
-        try:
-            conn = get_db_connection(target_db)
-            conn.execute("DELETE FROM conversations_ledger")
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
-        existing_ledger = {}
-    else:
-        existing_ledger = load_ledger_from_db(target_db)
+    lock_file = os.path.join(os.path.dirname(os.path.abspath(target_db)), ".scan.lock")
 
+    # Step 1: Scan filesystem OUTSIDE database lock for maximum performance
     live_convs, global_tools = scan_live_brain(target_brain)
-    live_map = {c["id"]: c for c in live_convs}
-    
-    for conv_id, live_c in live_map.items():
-        existing_ledger[conv_id] = live_c
-        existing_ledger[conv_id]["is_active"] = 1
 
-    for conv_id, past in existing_ledger.items():
-        if conv_id not in live_map:
-            past["is_active"] = 0
+    # Step 2: SQLite transactional UPSERT under InterProcessLock
+    with InterProcessLock(lock_file):
+        init_database(target_db)
+        conn = get_db_connection(target_db)
+        now_str = datetime.utcnow().isoformat() + "Z"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
 
-    all_merged_convs = list(existing_ledger.values())
-    save_conversations_to_ledger(all_merged_convs, target_db)
+            if rebuild:
+                cur.execute("DELETE FROM conversations_ledger")
+
+            for c in live_convs:
+                models_json = json.dumps(c.get("models") or [c.get("primary_model")])
+                tools_json = json.dumps(c.get("tools") or {})
+                trace_json = json.dumps(c.get("trace") or [])
+                anomaly_json = json.dumps(c.get("anomalies") or [])
+                daily_breakdown_json = json.dumps(c.get("daily_breakdown") or {})
+                first_date = str(c.get("first_date") or c.get("date") or "")
+                first_seen = c.get("first_seen_at") or now_str
+
+                cur.execute('''INSERT INTO conversations_ledger (
+                    conv_id, date, project, primary_model, models_json,
+                    fresh_input_tokens, cached_context_tokens, output_tokens, thinking_tokens, tool_call_tokens,
+                    total_tokens, cost_uncached_usd, cost_cached_usd, invocations,
+                    first_seen_at, last_updated_at, is_active, tools_json, trace_json, anomaly_json,
+                    daily_breakdown_json, first_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conv_id) DO UPDATE SET
+                    date = excluded.date,
+                    project = excluded.project,
+                    primary_model = excluded.primary_model,
+                    models_json = excluded.models_json,
+                    fresh_input_tokens = excluded.fresh_input_tokens,
+                    cached_context_tokens = excluded.cached_context_tokens,
+                    output_tokens = excluded.output_tokens,
+                    thinking_tokens = excluded.thinking_tokens,
+                    tool_call_tokens = excluded.tool_call_tokens,
+                    total_tokens = excluded.total_tokens,
+                    cost_uncached_usd = excluded.cost_uncached_usd,
+                    cost_cached_usd = excluded.cost_cached_usd,
+                    invocations = excluded.invocations,
+                    last_updated_at = excluded.last_updated_at,
+                    is_active = 1,
+                    tools_json = excluded.tools_json,
+                    trace_json = excluded.trace_json,
+                    anomaly_json = excluded.anomaly_json,
+                    daily_breakdown_json = excluded.daily_breakdown_json,
+                    first_date = excluded.first_date
+                ''', (
+                    c["id"], c["date"], c["project"], c["primary_model"], models_json,
+                    c.get("fresh_input_tokens", 0), c.get("cached_context_tokens", 0),
+                    c.get("output_tokens", 0), c.get("thinking_tokens", 0), c.get("tool_call_tokens", 0),
+                    c.get("total_tokens", 0), c.get("cost_uncached_usd", 0.0), c.get("cost_cached_usd", 0.0),
+                    c.get("invocations", 0), first_seen, now_str, 1,
+                    tools_json, trace_json, anomaly_json, daily_breakdown_json, first_date
+                ))
+
+            # Inactive check: Only mark is_active = 0 if session directory is proven absent on disk
+            if os.path.exists(target_brain):
+                cur.execute("SELECT conv_id FROM conversations_ledger WHERE is_active = 1")
+                for (cid,) in cur.fetchall():
+                    session_dir = os.path.join(target_brain, cid)
+                    if not os.path.exists(session_dir):
+                        cur.execute("UPDATE conversations_ledger SET is_active = 0 WHERE conv_id = ?", (cid,))
+
+            cur.execute('''INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_sync', ?)''', (now_str,))
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+        # Step 3: Read authoritative DB state
+        existing_ledger = load_ledger_from_db(target_db)
+        all_merged_convs = list(existing_ledger.values())
     
     overall = {
         "total_conversations": len(all_merged_convs),
@@ -1283,1827 +1456,43 @@ def print_cli_report(data):
     print("=" * 76 + "\n")
 
 # Complete Enterprise Dashboard HTML Template
-ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:;">
-  <title>Quota</title>
-  <style>
-    :root {
-      --bg: #09090b;
-      --card-bg: #121316;
-      --card-surface: #18191f;
-      --border: #222329;
-      --border-hover: #32343d;
-      --border-subtle: rgba(255, 255, 255, 0.05);
-      
-      --text-primary: #f4f4f5;
-      --text-secondary: #a1a1aa;
-      --text-tertiary: #71717a;
-      
-      --accent-blue: #3b82f6;
-      --accent-blue-subtle: rgba(59, 130, 246, 0.12);
-      --accent-purple: #8b5cf6;
-      --accent-purple-subtle: rgba(139, 92, 246, 0.12);
-      --accent-emerald: #10b981;
-      --accent-emerald-subtle: rgba(16, 185, 129, 0.12);
-      --accent-amber: #f59e0b;
-      --accent-amber-subtle: rgba(245, 158, 11, 0.12);
-      --accent-rose: #f43f5e;
-      --accent-rose-subtle: rgba(244, 63, 94, 0.12);
-      
-      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    }
-
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background-color: var(--bg);
-      color: var(--text-primary);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      font-size: 13px;
-      line-height: 1.5;
-      padding: 24px 32px;
-      -webkit-font-smoothing: antialiased;
-    }
-
-    .container { max-width: 1400px; margin: 0 auto; }
-
-    /* Top Navigation Header */
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 24px;
-      padding-bottom: 20px;
-      border-bottom: 1px solid var(--border);
-    }
-    .brand-section { display: flex; align-items: center; gap: 14px; }
-    .brand-logo-img {
-      width: 44px;
-      height: 44px;
-      border-radius: 11px;
-      object-fit: cover;
-      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
-      display: block;
-    }
-    .brand-title {
-      font-size: 25px; /* Increased 20%+ from 20px */
-      font-weight: 750;
-      letter-spacing: -0.03em;
-      color: var(--text-primary);
-    }
-    .brand-icon svg { width: 20px; height: 20px; fill: white; }
-    .brand-titles h1 { font-size: 18px; font-weight: 650; letter-spacing: -0.02em; color: var(--text-primary); }
-    .breadcrumb { font-size: 12px; color: var(--text-tertiary); display: flex; gap: 6px; align-items: center; }
-
-    .header-actions { display: flex; align-items: center; gap: 10px; }
-    .sync-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 11px;
-      color: #34d399;
-      background: var(--accent-emerald-subtle);
-      border: 1px solid rgba(16, 185, 129, 0.2);
-      padding: 5px 10px;
-      border-radius: 9999px;
-      font-weight: 500;
-    }
-    .pulse-dot { width: 6px; height: 6px; border-radius: 50%; background-color: #34d399; animation: pulse 2s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.85); } }
-
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      color: var(--text-primary);
-      padding: 6px 12px;
-      border-radius: 7px;
-      font-size: 12px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-    .btn:hover { background: var(--card-surface); border-color: var(--border-hover); }
-    .btn-primary { background: #2563eb; border-color: #3b82f6; color: white; }
-    .btn-primary:hover { background: #1d4ed8; }
-
-    /* KPI Metrics Hero Strip */
-    .metric-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-      gap: 16px;
-      margin-bottom: 24px;
-    }
-    .metric-card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 18px 20px;
-      position: relative;
-      transition: border-color 0.15s;
-      min-width: 0;
-    }
-    .metric-card:hover { border-color: var(--border-hover); }
-    .metric-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 8px;
-      gap: 8px;
-    }
-    .metric-label {
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-tertiary);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      flex: 1;
-    }
-    .metric-value { font-size: 28px; font-weight: 700; letter-spacing: -0.03em; color: var(--text-primary); font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .metric-sub { font-size: 11px; color: var(--text-secondary); margin-top: 6px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
-
-    .badge-pill {
-      font-size: 10px;
-      font-weight: 600;
-      padding: 3px 8px;
-      border-radius: 9999px;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      white-space: nowrap;
-      flex-shrink: 0;
-      line-height: 1.3;
-    }
-    .badge-green { background: var(--accent-emerald-subtle); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.2); }
-    .badge-blue { background: var(--accent-blue-subtle); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.2); }
-    .badge-amber { background: var(--accent-amber-subtle); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.2); }
-    .badge-rose { background: var(--accent-rose-subtle); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.2); }
-
-    /* Interactive Timeline Section */
-    .timeline-card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 20px;
-      margin-bottom: 24px;
-    }
-    .timeline-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 16px;
-    }
-    .timeline-title { font-size: 13px; font-weight: 650; color: var(--text-primary); display: flex; align-items: center; gap: 8px; }
-    .toggle-group {
-      display: inline-flex;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 7px;
-      padding: 2px;
-      gap: 2px;
-    }
-    .toggle-btn {
-      background: transparent;
-      border: none;
-      color: var(--text-tertiary);
-      font-size: 11px;
-      font-weight: 500;
-      padding: 4px 10px;
-      border-radius: 5px;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .toggle-btn.active {
-      background: var(--card-surface);
-      color: var(--text-primary);
-      box-shadow: 0 1px 3px rgba(0,0,0,0.3);
-    }
-
-    .chart-container {
-      width: 100%;
-      height: 170px;
-      position: relative;
-    }
-    .chart-svg {
-      width: 100%;
-      height: 100%;
-      overflow: visible;
-    }
-    .bar-rect {
-      transition: opacity 0.15s, fill 0.15s;
-      cursor: pointer;
-    }
-    .bar-rect:hover { opacity: 0.85; filter: drop-shadow(0 0 6px rgba(59, 130, 246, 0.4)); }
-
-    /* Floating Tooltip */
-    #chart-tooltip {
-      position: absolute;
-      display: none;
-      background: #1e1f26;
-      border: 1px solid #32343d;
-      border-radius: 7px;
-      padding: 8px 12px;
-      font-size: 11px;
-      color: var(--text-primary);
-      box-shadow: 0 6px 20px rgba(0,0,0,0.5);
-      pointer-events: none;
-      z-index: 100;
-      transform: translate(-50%, -120%);
-    }
-
-    /* Tabbed Navigation */
-    .tabs-nav {
-      display: flex;
-      gap: 4px;
-      border-bottom: 1px solid var(--border);
-      margin-bottom: 20px;
-    }
-    .tab-btn {
-      background: transparent;
-      border: none;
-      color: var(--text-tertiary);
-      font-size: 12px;
-      font-weight: 500;
-      padding: 8px 14px;
-      cursor: pointer;
-      border-bottom: 2px solid transparent;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      transition: color 0.15s, border-color 0.15s;
-    }
-    .tab-btn:hover { color: var(--text-secondary); }
-    .tab-btn.active { color: var(--text-primary); border-bottom-color: var(--accent-blue); font-weight: 600; }
-    .tab-pane { display: none; }
-    .tab-pane.active { display: block; }
-
-    /* Segmented Progress Bar */
-    .segmented-bar-container {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 20px;
-      margin-bottom: 24px;
-    }
-    .segmented-bar-title {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 14px;
-    }
-    .segmented-bar-title h3 { font-size: 13px; font-weight: 650; }
-    .segmented-bar-track {
-      display: flex;
-      height: 12px;
-      border-radius: 6px;
-      overflow: hidden;
-      background: #1a1b22;
-      margin-bottom: 16px;
-      border: 1px solid rgba(255, 255, 255, 0.05);
-    }
-    .segment-fill { height: 100%; transition: width 0.3s ease; }
-    .seg-cache { background: linear-gradient(90deg, #7c3aed, #a855f7); }
-    .seg-fresh { background: #3b82f6; }
-    .seg-output { background: #10b981; }
-    .seg-thinking { background: #f43f5e; }
-    .seg-tools { background: #f59e0b; }
-
-    .segment-legend-grid {
-      display: grid;
-      grid-template-columns: repeat(5, 1fr);
-      gap: 12px;
-    }
-    .legend-item {
-      background: var(--card-surface);
-      border: 1px solid var(--border-subtle);
-      border-radius: 8px;
-      padding: 12px;
-    }
-    .legend-top { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-secondary); margin-bottom: 4px; }
-    .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
-    .legend-val { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
-    .legend-desc { font-size: 10px; color: var(--text-tertiary); margin-top: 2px; }
-
-    /* Dual Grid Panels */
-    .dual-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-      margin-bottom: 24px;
-    }
-    .panel {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 20px;
-    }
-    .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-    .panel-title { font-size: 13px; font-weight: 650; }
-
-    /* Workspaces List */
-    .dense-list { display: flex; flex-direction: column; gap: 10px; }
-    .dense-item {
-      background: var(--card-surface);
-      border: 1px solid var(--border-subtle);
-      border-radius: 8px;
-      padding: 10px 14px;
-    }
-    .dense-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-    .dense-name { font-weight: 600; font-size: 12px; }
-    .dense-val { font-family: var(--font-mono); font-size: 12px; color: var(--text-primary); }
-    .dense-track { height: 4px; border-radius: 2px; background: #262730; overflow: hidden; }
-    .dense-fill { height: 100%; border-radius: 2px; background: #3b82f6; }
-
-    /* Tables */
-    .table-container {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      overflow-x: auto;
-      overflow-y: hidden;
-      -webkit-overflow-scrolling: touch;
-    }
-    .table-controls {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 14px 18px;
-      border-bottom: 1px solid var(--border);
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .search-box {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text-primary);
-      padding: 6px 12px;
-      border-radius: 6px;
-      font-size: 12px;
-      width: 240px;
-      outline: none;
-    }
-    .search-box:focus { border-color: var(--accent-blue); }
-    .filter-select {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text-secondary);
-      padding: 6px 10px;
-      border-radius: 6px;
-      font-size: 12px;
-      outline: none;
-    }
-
-    table {
-      width: 100%;
-      min-width: 940px;
-      border-collapse: collapse;
-      text-align: left;
-    }
-    th {
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--text-tertiary);
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      padding: 11px 16px;
-      border-bottom: 1px solid var(--border);
-      background: rgba(0,0,0,0.25);
-      white-space: nowrap;
-    }
-    td {
-      font-size: 12px;
-      padding: 11px 16px;
-      border-bottom: 1px solid var(--border-subtle);
-      color: var(--text-secondary);
-      white-space: nowrap;
-      vertical-align: middle;
-    }
-    tr.clickable-row { cursor: pointer; transition: background 0.15s; }
-    tr.clickable-row:hover { background: rgba(255,255,255,0.04); }
-    .mono { font-family: var(--font-mono); font-size: 11px; }
-
-    /* Slide-Over Detail Drawer */
-    .drawer-overlay {
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0, 0, 0, 0.6);
-      backdrop-filter: blur(3px);
-      z-index: 200;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.25s ease;
-    }
-    .drawer-overlay.open { opacity: 1; pointer-events: auto; }
-
-    .trace-drawer {
-      position: fixed;
-      top: 0; right: 0; bottom: 0;
-      width: 620px;
-      max-width: 90vw;
-      background: #111216;
-      border-left: 1px solid var(--border);
-      box-shadow: -10px 0 30px rgba(0, 0, 0, 0.7);
-      z-index: 201;
-      transform: translateX(100%);
-      transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-    .trace-drawer.open { transform: translateX(0); }
-
-    .drawer-header {
-      padding: 18px 24px;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      background: #14161c;
-    }
-    .drawer-header h2 { font-size: 15px; font-weight: 650; }
-    .drawer-close-btn {
-      background: transparent;
-      border: none;
-      color: var(--text-tertiary);
-      font-size: 18px;
-      cursor: pointer;
-      padding: 4px;
-    }
-    .drawer-close-btn:hover { color: var(--text-primary); }
-
-    .drawer-body {
-      padding: 24px;
-      overflow-y: auto;
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-    }
-    .drawer-section-title {
-      font-size: 11px;
-      font-weight: 650;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-tertiary);
-      margin-bottom: 10px;
-    }
-
-    .curve-container {
-      background: var(--card-surface);
-      border: 1px solid var(--border-subtle);
-      border-radius: 8px;
-      padding: 16px;
-      height: 150px;
-      position: relative;
-    }
-
-    .tool-pills { display: flex; flex-wrap: wrap; gap: 6px; }
-    .tool-pill {
-      background: #1e1f28;
-      border: 1px solid #2e303d;
-      padding: 4px 9px;
-      border-radius: 6px;
-      font-size: 11px;
-      font-family: var(--font-mono);
-      color: #93c5fd;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .tool-pill span { color: #f4f4f5; font-weight: 600; }
-
-    /* Modal for Budget Config */
-    .modal-overlay {
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0,0,0,0.7);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      z-index: 300;
-    }
-    .modal-overlay.open { display: flex; }
-    .modal-card {
-      background: #14161c;
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      width: 400px;
-      padding: 24px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.8);
-    }
-    .modal-card h3 { font-size: 15px; margin-bottom: 14px; }
-    .form-group { margin-bottom: 16px; }
-    .form-group label { display: block; font-size: 11px; color: var(--text-tertiary); margin-bottom: 6px; text-transform: uppercase; }
-    .form-group input {
-      width: 100%;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text-primary);
-      padding: 8px 12px;
-      border-radius: 6px;
-      font-size: 13px;
-      outline: none;
-    }
-    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <!-- Header -->
-    <header class="header">
-      <div class="brand-section">
-        <img src="__LOGO_PLACEHOLDER__" alt="Quota Logo" class="brand-logo-img" />
-        <div class="brand-titles">
-          <h1 class="brand-title">Quota</h1>
-        </div>
-      </div>
-
-      <div class="header-actions">
-        <button class="btn btn-primary" id="refresh-btn" onclick="handleRefresh()" title="Scan active transcripts and refresh metrics immediately">
-          <svg id="refresh-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-          <span id="refresh-label">Refresh Data</span>
-        </button>
-        <button class="btn" onclick="exportLedgerCsv()">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-          Export CSV
-        </button>
-        <button class="btn" onclick="copyMarkdownSummary()">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-          Copy Report
-        </button>
-      </div>
-    </header>
-
-    <!-- KPI Metric Cards Strip -->
-    <div class="metric-grid">
-      <!-- Total Volume -->
-      <div class="metric-card">
-        <div class="metric-header">
-          <span class="metric-label">Total Processed Volume</span>
-          <span class="badge-pill badge-blue" id="kpi-cache-hit">99.9% Cache Hit</span>
-        </div>
-        <div class="metric-value" id="kpi-volume">6.40B</div>
-        <div class="metric-sub">
-          <span id="kpi-unique-tok">12.5M unique content</span>
-          <span>&bull;</span>
-          <span>Multi-turn context</span>
-        </div>
-      </div>
-
-      <!-- Standard Valuation -->
-      <div class="metric-card">
-        <div class="metric-header">
-          <span class="metric-label">Standard API Valuation</span>
-          <span style="color: var(--text-tertiary);">&#36;</span>
-        </div>
-        <div class="metric-value" id="kpi-std-cost">&#36;4,394.24</div>
-        <div class="metric-sub">Stateless commercial rate equivalent</div>
-      </div>
-
-      <!-- Prompt Cached Real Cost -->
-      <div class="metric-card">
-        <div class="metric-header">
-          <span class="metric-label">Prompt-Cached Cost</span>
-          <span class="badge-pill badge-green" id="kpi-savings">-$3,810 (86.7%)</span>
-        </div>
-        <div class="metric-value" style="color: #60a5fa;" id="kpi-cached-cost">&#36;584.07</div>
-        <div class="metric-sub">Automatic context cache discount</div>
-      </div>
-
-      <!-- Autonomous Invocations -->
-      <div class="metric-card">
-        <div class="metric-header">
-          <span class="metric-label">Autonomous Invocations</span>
-          <span class="badge-pill badge-blue" id="kpi-sessions-badge">40 Sessions</span>
-        </div>
-        <div class="metric-value" id="kpi-invocations">10,409</div>
-        <div class="metric-sub">
-          <span id="kpi-workspaces-count">8 workspaces</span>
-          <span>&bull;</span>
-          <span id="kpi-turns-per-chat">Avg 260 turns / session</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Activity & Inference Timeline Card -->
-    <div class="timeline-card">
-      <div class="timeline-header">
-        <div>
-          <div class="timeline-title">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-            <span>Activity & Inference Timeline</span>
-          </div>
-          <div class="timeline-summary-stats" id="timeline-summary-stats" style="font-size: 11px; color: var(--text-tertiary); margin-top: 4px;"></div>
-        </div>
-        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-          <div class="toggle-group" id="range-toggle-group">
-            <button id="range-14d" class="toggle-btn" onclick="setTimelineRange('14d')">14D</button>
-            <button id="range-30d" class="toggle-btn active" onclick="setTimelineRange('30d')">30D</button>
-            <button id="range-all" class="toggle-btn" onclick="setTimelineRange('all')">All History</button>
-          </div>
-          <div class="toggle-group" id="metric-toggle-group">
-            <button id="toggle-cost" class="toggle-btn active" onclick="setTimelineMetric('cost')">Commercial Cost ($)</button>
-            <button id="toggle-tokens" class="toggle-btn" onclick="setTimelineMetric('tokens')">Token Volume</button>
-            <button id="toggle-invs" class="toggle-btn" onclick="setTimelineMetric('invs')">Invocations</button>
-          </div>
-        </div>
-      </div>
-      <div class="chart-container" id="timeline-container" style="height: 220px; position: relative;">
-        <svg class="chart-svg" id="timeline-svg" viewBox="0 0 1000 220" preserveAspectRatio="none"></svg>
-        <div id="chart-tooltip"></div>
-      </div>
-    </div>
-
-    <!-- Tabbed Navigation Bar -->
-    <nav class="tabs-nav">
-      <button class="tab-btn active" data-tab="overview" onclick="switchTab('overview', this)">Overview</button>
-      <button class="tab-btn" data-tab="models" onclick="switchTab('models', this)">Model Intelligence & Pricing</button>
-      <button class="tab-btn" data-tab="tools" onclick="switchTab('tools', this)">Tool Consumption</button>
-      <button class="tab-btn" data-tab="projects" onclick="switchTab('projects', this)">Workspace Allocation</button>
-      <button class="tab-btn" data-tab="ledger" onclick="switchTab('ledger', this)">Conversation Ledger</button>
-    </nav>
-
-    <!-- Tab 1: Overview Pane -->
-    <div id="tab-overview" class="tab-pane active">
-      <!-- Budget & Spend Pacing Panel -->
-      <div class="panel" style="margin-bottom: 20px;">
-        <div class="panel-header">
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <h3 class="panel-title">Budget Guardrails & Spend Pacing</h3>
-            <span class="badge-pill badge-green" id="budget-status-badge">Normal</span>
-          </div>
-          <button class="btn" style="font-size: 11px; padding: 4px 8px;" onclick="openBudgetModal()">Configure Budget</button>
-        </div>
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 12px;">
-          <div style="background: var(--card-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px;">
-            <div style="font-size: 11px; color: var(--text-tertiary); text-transform: uppercase;">Today's Spend / Daily Target</div>
-            <div style="font-size: 18px; font-weight: 700; margin: 4px 0;" id="budget-today-text">$0.00 / $5.00</div>
-            <div class="dense-track" style="margin-top: 8px;">
-              <div id="budget-today-bar" class="dense-fill" style="width: 0%; background: #10b981;"></div>
-            </div>
-          </div>
-          <div style="background: var(--card-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px;">
-            <div style="font-size: 11px; color: var(--text-tertiary); text-transform: uppercase;">Month-to-Date / Monthly Target</div>
-            <div style="font-size: 18px; font-weight: 700; margin: 4px 0;" id="budget-month-text">$0.00 / $50.00</div>
-            <div class="dense-track" style="margin-top: 8px;">
-              <div id="budget-month-bar" class="dense-fill" style="width: 0%; background: #3b82f6;"></div>
-            </div>
-          </div>
-          <div style="background: var(--card-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px;">
-            <div style="font-size: 11px; color: var(--text-tertiary); text-transform: uppercase;">Projected Run-Rate (30 Days)</div>
-            <div style="font-size: 18px; font-weight: 700; margin: 4px 0; color: #60a5fa;" id="budget-proj-text">$0.00</div>
-            <div style="font-size: 11px; color: var(--text-tertiary); margin-top: 8px;">Calculated from current calendar velocity</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Segmented Ingestion Bar -->
-      <div class="segmented-bar-container">
-        <div class="segmented-bar-title">
-          <h3>Token Distribution Across Ingestion & Generation Layers</h3>
-          <span class="badge-pill badge-green" id="hit-ratio-badge">99.9% Context Hit Ratio</span>
-        </div>
-        <div class="segmented-bar-track" id="segmented-track"></div>
-        <div class="segment-legend-grid" id="segmented-legend"></div>
-      </div>
-
-      <!-- Dual Grid: Providers & Workspaces -->
-      <div class="dual-grid">
-        <!-- Provider Donut -->
-        <div class="panel">
-          <div class="panel-header">
-            <h3 class="panel-title">Provider Share (Google vs Anthropic)</h3>
-            <span style="font-size: 11px; color: var(--text-tertiary);">By volume</span>
-          </div>
-          <div style="display: flex; align-items: center; gap: 24px;">
-            <div id="provider-donut-container"></div>
-            <div style="flex: 1;" class="dense-list" id="provider-list"></div>
-          </div>
-        </div>
-
-        <!-- Top Workspaces -->
-        <div class="panel">
-          <div class="panel-header">
-            <h3 class="panel-title">Top Workspaces by Consumption</h3>
-            <span style="font-size: 11px; color: var(--text-tertiary);">Cumulative</span>
-          </div>
-          <div class="dense-list" id="top-projects-list"></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Tab 2: Models Pane -->
-    <div id="tab-models" class="tab-pane">
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Model Name</th>
-              <th>Provider</th>
-              <th>Total Volume</th>
-              <th>Generated Out</th>
-              <th>Reasoning</th>
-              <th>Tool Args</th>
-              <th>Standard Cost</th>
-              <th>Prompt-Cached Cost</th>
-            </tr>
-          </thead>
-          <tbody id="models-table-body"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Tab 3: Tool Consumption Pane -->
-    <div id="tab-tools" class="tab-pane">
-      <div class="panel" style="margin-bottom: 20px;">
-        <h3 class="panel-title" style="margin-bottom: 6px;">Autonomous Agent Tool Execution Profile</h3>
-        <p style="font-size: 12px; color: var(--text-secondary);">Breakdown of tokens consumed and invocations made across tool commands (bash commands, file reading, code editing, web search).</p>
-      </div>
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Tool Name</th>
-              <th>Invocations</th>
-              <th>Estimated Tokens</th>
-              <th>Share of Tool Usage</th>
-            </tr>
-          </thead>
-          <tbody id="tools-table-body"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Tab 4: Workspace Allocation Pane -->
-    <div id="tab-projects" class="tab-pane">
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Workspace / Project</th>
-              <th>Chats</th>
-              <th>Invocations</th>
-              <th>Total Tokens</th>
-              <th>Standard Cost</th>
-              <th>Cached Cost</th>
-              <th>Primary Models</th>
-            </tr>
-          </thead>
-          <tbody id="projects-table-body"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Tab 5: Conversation Ledger Pane -->
-    <div id="tab-ledger" class="tab-pane">
-      <div class="table-container">
-        <div class="table-controls">
-          <input type="text" id="chat-search" class="search-box" placeholder="Filter by project or ID..." oninput="filterChats()" />
-          <select id="chat-model-filter" class="filter-select" onchange="filterChats()"><option value="">All Models</option></select>
-          <select id="chat-project-filter" class="filter-select" onchange="filterChats()"><option value="">All Workspaces</option></select>
-          <select id="chat-status-filter" class="filter-select" onchange="filterChats()">
-            <option value="">All Statuses</option>
-            <option value="active">Active Sessions</option>
-            <option value="archived">Preserved / Archived</option>
-          </select>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th>Workspace</th>
-              <th>Primary Model</th>
-              <th>Turns</th>
-              <th>Context Compounded</th>
-              <th>Output</th>
-              <th>Reasoning</th>
-              <th>Standard Cost</th>
-              <th>Cached Cost</th>
-              <th>Anomalies / Tags</th>
-            </tr>
-          </thead>
-          <tbody id="chats-table-body"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <!-- Slide-Over Trace Inspector Drawer -->
-  <div id="drawer-overlay" class="drawer-overlay" onclick="closeDrawer()"></div>
-  <aside id="trace-drawer" class="trace-drawer">
-    <div class="drawer-header">
-      <div>
-        <h2 id="drawer-title">Session Trace Inspector</h2>
-        <div style="font-size: 11px; color: var(--text-tertiary); margin-top: 2px;" id="drawer-subtitle">cbea9de5 &bull; Projectss</div>
-      </div>
-      <button class="drawer-close-btn" onclick="closeDrawer()">&times;</button>
-    </div>
-    <div class="drawer-body">
-      <!-- Section 1: Context Compounding Curve -->
-      <div>
-        <div class="drawer-section-title">Context Compounding Curve (Tokens / Turn)</div>
-        <div class="curve-container">
-          <svg id="drawer-curve-svg" style="width: 100%; height: 100%;" viewBox="0 0 500 120" preserveAspectRatio="none"></svg>
-        </div>
-      </div>
-
-      <!-- Section 2: Token Anatomy Cards -->
-      <div>
-        <div class="drawer-section-title">Token Ingestion & Generation Breakdown</div>
-        <div class="segment-legend-grid" style="grid-template-columns: repeat(2, 1fr);" id="drawer-tokens-grid"></div>
-      </div>
-
-      <!-- Section 3: Tool Execution Matrix -->
-      <div>
-        <div class="drawer-section-title">Agent Tools Executed</div>
-        <div class="tool-pills" id="drawer-tools-pills"></div>
-      </div>
-
-      <!-- Section 4: Turn-by-Turn Stepper Table -->
-      <div>
-        <div class="drawer-section-title">Turn Progression Timeline</div>
-        <div class="table-container" style="max-height: 240px; overflow-y: auto;">
-          <table>
-            <thead>
-              <tr>
-                <th>Turn</th>
-                <th>Context</th>
-                <th>Output</th>
-                <th>Tools</th>
-                <th>Cost</th>
-              </tr>
-            </thead>
-            <tbody id="drawer-steps-body"></tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  </aside>
-
-
-
-  <script>
-    const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : null;
-    let DATA = __DATA_PLACEHOLDER__;
-
-    function escapeHtml(str) {
-      if (!str) return '';
-      return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
-    }
-    let activeDrawerConvId = null;
-    let currentTab = "overview";
-    let timelineMode = 'cost';
-
-    function formatNumber(num) {
-      if (!num || isNaN(num)) return '0';
-      if (num >= 1e9) return (num / 1e9).toFixed(2) + 'B';
-      if (num >= 1e6) return (num / 1e6).toFixed(2) + 'M';
-      if (num >= 1e3) return (num / 1e3).toFixed(1) + 'k';
-      return num.toLocaleString();
-    }
-
-    function formatCurrency(val) {
-      if (!val || isNaN(val)) return '$0.00';
-      return '$' + Number(val).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    }
-
-    function renderBudget() {
-      const b = DATA.budget || {};
-      const todayText = document.getElementById('budget-today-text');
-      const todayBar = document.getElementById('budget-today-bar');
-      const monthText = document.getElementById('budget-month-text');
-      const monthBar = document.getElementById('budget-month-bar');
-      const projText = document.getElementById('budget-proj-text');
-      const badge = document.getElementById('budget-status-badge');
-
-      const todayCost = b.today_cost_cached || 0;
-      const dailyTarget = b.daily_target_usd || 5.0;
-      const monthCost = b.month_cost_cached || 0;
-      const monthlyTarget = b.monthly_target_usd || 50.0;
-      const projCost = b.projected_month_cost || 0;
-      const status = b.status || 'normal';
-
-      if (todayText) todayText.innerText = `$${todayCost.toFixed(2)} / $${dailyTarget.toFixed(2)}`;
-      if (monthText) monthText.innerText = `$${monthCost.toFixed(2)} / $${monthlyTarget.toFixed(2)}`;
-      if (projText) projText.innerText = `$${projCost.toFixed(2)} USD`;
-
-      const todayPct = Math.min(100, Math.round((todayCost / Math.max(0.01, dailyTarget)) * 100));
-      const monthPct = Math.min(100, Math.round((monthCost / Math.max(0.01, monthlyTarget)) * 100));
-
-      if (todayBar) {
-        todayBar.style.width = todayPct + '%';
-        todayBar.style.background = status === 'exceeded' ? '#f43f5e' : (status === 'warning' ? '#f59e0b' : '#10b981');
-      }
-      if (monthBar) {
-        monthBar.style.width = monthPct + '%';
-        monthBar.style.background = status === 'exceeded' ? '#f43f5e' : (status === 'warning' ? '#f59e0b' : '#3b82f6');
-      }
-
-      if (badge) {
-        badge.innerText = status.toUpperCase();
-        badge.className = 'badge-pill ' + (status === 'exceeded' ? 'badge-rose' : (status === 'warning' ? 'badge-amber' : 'badge-green'));
-      }
-    }
-
-    function openBudgetModal() {
-      const b = DATA.budget || {};
-      document.getElementById('budget-input-daily').value = (b.daily_target_usd || 5).toFixed(2);
-      document.getElementById('budget-input-monthly').value = (b.monthly_target_usd || 50).toFixed(2);
-      document.getElementById('budget-modal').classList.add('open');
-    }
-
-    function closeBudgetModal() {
-      document.getElementById('budget-modal').classList.remove('open');
-    }
-
-    function saveBudgetFromModal() {
-      const daily = parseFloat(document.getElementById('budget-input-daily').value) || 5.0;
-      const monthly = parseFloat(document.getElementById('budget-input-monthly').value) || 50.0;
-      closeBudgetModal();
-      if (vscode) {
-        vscode.postMessage({ command: 'setBudget', daily: daily, monthly: monthly });
-      } else {
-        alert(`Budget updated to $${daily.toFixed(2)}/day, $${monthly.toFixed(2)}/month`);
-      }
-    }
-
-    // Init Metrics
-    function initMetrics() {
-      const s = DATA.summary || {};
-      document.getElementById('kpi-volume').innerText = formatNumber(s.total_cumulative_tokens || 0);
-      const hitRatio = (s.cache_hit_ratio_pct !== undefined && s.cache_hit_ratio_pct !== null) ? s.cache_hit_ratio_pct : 0;
-      document.getElementById('kpi-cache-hit').innerText = hitRatio.toFixed(1) + '% Cache Hit';
-      document.getElementById('kpi-unique-tok').innerText = formatNumber(s.unique_content_tokens || 0) + ' unique stored';
-      document.getElementById('kpi-std-cost').innerText = formatCurrency(s.cost_uncached_usd || 0);
-      document.getElementById('kpi-cached-cost').innerText = formatCurrency(s.cost_cached_usd || 0);
-      const savingsPct = (s.cost_uncached_usd && s.cost_uncached_usd > 0)
-        ? (((s.cache_savings_usd || 0) / s.cost_uncached_usd) * 100).toFixed(1)
-        : '0.0';
-      document.getElementById('kpi-savings').innerText = `-${formatCurrency(s.cache_savings_usd || 0)} (${savingsPct}%)`;
-
-      // Card 4: Autonomous Invocations
-      document.getElementById('kpi-invocations').innerText = (s.total_invocations || 0).toLocaleString();
-      document.getElementById('kpi-sessions-badge').innerText = `${s.total_conversations || 0} Sessions`;
-      const numProjects = Object.keys(DATA.projects || {}).length;
-      document.getElementById('kpi-workspaces-count').innerText = `${numProjects} workspaces`;
-      const avgTurns = s.total_conversations ? Math.round((s.total_invocations || 0) / s.total_conversations) : 0;
-      document.getElementById('kpi-turns-per-chat').innerText = `Avg ${avgTurns} turns / session`;
-      renderBudget();
-    }
-    initMetrics();
-
-    // State-of-the-Art Continuous Timeline & Area Curve
-    let timelineRange = '30d';
-    let timelineMetric = 'cost';
-
-    function setTimelineRange(range) {
-      timelineRange = range;
-      ['14d', '30d', 'all'].forEach(r => {
-        const btn = document.getElementById('range-' + r);
-        if (btn) btn.className = 'toggle-btn ' + (r === range ? 'active' : '');
-      });
-      renderTimeline();
-    }
-
-    function setTimelineMetric(metric) {
-      timelineMetric = metric;
-      document.getElementById('toggle-cost').className = 'toggle-btn ' + (metric === 'cost' ? 'active' : '');
-      document.getElementById('toggle-tokens').className = 'toggle-btn ' + (metric === 'tokens' ? 'active' : '');
-      document.getElementById('toggle-invs').className = 'toggle-btn ' + (metric === 'invs' ? 'active' : '');
-      renderTimeline();
-    }
-
-    function getContinuousTimelineData(range) {
-      const raw = DATA.timeline || [];
-      if (!raw.length) return [];
-      
-      const map = {};
-      raw.forEach(d => { map[d.date] = d; });
-      
-      if (range === 'all') {
-        return raw;
-      }
-      
-      const numDays = range === '14d' ? 14 : 30;
-      const latestDateStr = raw[raw.length - 1].date;
-      const endDt = new Date(latestDateStr + 'T00:00:00Z');
-      
-      const result = [];
-      for (let i = numDays - 1; i >= 0; i--) {
-        const dt = new Date(endDt.getTime() - i * 86400000);
-        const dtStr = dt.toISOString().slice(0, 10);
-        if (map[dtStr]) {
-          result.push(map[dtStr]);
-        } else {
-          result.push({
-            date: dtStr,
-            tokens: 0,
-            cost_uncached_usd: 0,
-            cost_cached_usd: 0,
-            invocations: 0,
-            fresh_input_tokens: 0,
-            cached_context_tokens: 0,
-            output_tokens: 0,
-            thinking_tokens: 0
-          });
-        }
-      }
-      return result;
-    }
-
-    // Monotone Cubic Spline (Fritsch-Carlson) - Mathematically prevents negative overshoots
-    function getMonotoneSplinePath(points, baselineY, padTop = 30) {
-      const n = points.length;
-      if (n === 0) return '';
-      if (n === 1) return `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
-      if (n === 2) {
-        return `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)} L ${points[1].x.toFixed(1)},${points[1].y.toFixed(1)}`;
-      }
-
-      const dx = new Array(n - 1);
-      const dy = new Array(n - 1);
-      const slopes = new Array(n - 1);
-      for (let i = 0; i < n - 1; i++) {
-        dx[i] = points[i + 1].x - points[i].x;
-        dy[i] = points[i + 1].y - points[i].y;
-        slopes[i] = dx[i] !== 0 ? dy[i] / dx[i] : 0;
-      }
-
-      const tangents = new Array(n);
-      tangents[0] = slopes[0];
-      for (let i = 1; i < n - 1; i++) {
-        if (slopes[i - 1] * slopes[i] <= 0) {
-          tangents[i] = 0;
-        } else {
-          tangents[i] = (slopes[i - 1] + slopes[i]) / 2;
-        }
-      }
-      tangents[n - 1] = slopes[n - 2];
-
-      for (let i = 0; i < n - 1; i++) {
-        if (dy[i] === 0 || slopes[i] === 0) {
-          tangents[i] = 0;
-          tangents[i + 1] = 0;
-        } else {
-          const a = tangents[i] / slopes[i];
-          const b = tangents[i + 1] / slopes[i];
-          if (a < 0) tangents[i] = 0;
-          if (b < 0) tangents[i + 1] = 0;
-          const h = a * a + b * b;
-          if (h > 9) {
-            const tau = 3 / Math.sqrt(h);
-            tangents[i] = tau * a * slopes[i];
-            tangents[i + 1] = tau * b * slopes[i];
-          }
-        }
-      }
-
-      let path = `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
-      for (let i = 0; i < n - 1; i++) {
-        const segDx = dx[i] / 3;
-        let cp1x = points[i].x + segDx;
-        let cp1y = points[i].y + tangents[i] * segDx;
-        let cp2x = points[i + 1].x - segDx;
-        let cp2y = points[i + 1].y - tangents[i + 1] * segDx;
-
-        // Guaranteed symmetric boundary clamping: between top bound and baseline
-        cp1y = Math.max(padTop, Math.min(baselineY, cp1y));
-        cp2y = Math.max(padTop, Math.min(baselineY, cp2y));
-
-        path += ` C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${points[i + 1].x.toFixed(1)},${points[i + 1].y.toFixed(1)}`;
-      }
-      return path;
-    }
-
-    function renderTimeline() {
-      const svg = document.getElementById('timeline-svg');
-      const statsEl = document.getElementById('timeline-summary-stats');
-      const data = getContinuousTimelineData(timelineRange);
-      if (!data || !data.length) {
-        if (svg) svg.innerHTML = '<text x="500" y="110" fill="#71717a" text-anchor="middle" font-size="13">No telemetry data recorded for this period</text>';
-        return;
-      }
-
-      const W = 1000, H = 220;
-      const padLeft = 65, padRight = 30, padTop = 30, padBottom = 35;
-      const chartW = W - padLeft - padRight;
-      const chartH = H - padTop - padBottom;
-      const baselineY = padTop + chartH;
-
-      const values = data.map(d => {
-        if (timelineMetric === 'cost') return d.cost_cached_usd || 0;
-        if (timelineMetric === 'tokens') return d.tokens || 0;
-        return d.invocations || 0;
-      });
-
-      const rawMax = Math.max(...values);
-      const minCeil = timelineMetric === 'cost' ? 1.0 : (timelineMetric === 'tokens' ? 100000 : 10);
-      const maxVal = Math.max(rawMax * 1.15, minCeil);
-      const totalPeriod = values.reduce((a, b) => a + b, 0);
-      const avgPeriod = totalPeriod / data.length;
-      const peakIdx = values.indexOf(Math.max(...values));
-      const peakDate = data[peakIdx] ? data[peakIdx].date : '';
-      const peakVal = values[peakIdx] || 0;
-      const activeDaysCount = data.filter(d => (d.tokens || 0) > 0).length;
-
-      if (statsEl) {
-        const totalFmt = timelineMetric === 'cost' ? formatCurrency(totalPeriod) : (timelineMetric === 'tokens' ? formatNumber(totalPeriod) + ' tokens' : totalPeriod.toLocaleString() + ' turns');
-        const peakFmt = timelineMetric === 'cost' ? formatCurrency(peakVal) : (timelineMetric === 'tokens' ? formatNumber(peakVal) : peakVal.toLocaleString());
-        statsEl.innerHTML = `
-          <span>Period Total: <strong style="color:#f4f4f5;">${totalFmt}</strong></span>
-          <span style="margin: 0 6px;">&bull;</span>
-          <span>Daily Avg: <strong style="color:#a1a1aa;">${timelineMetric === 'cost' ? formatCurrency(avgPeriod) : formatNumber(avgPeriod)}</strong></span>
-          <span style="margin: 0 6px;">&bull;</span>
-          <span>Peak: <strong style="color:#34d399;">${peakFmt}</strong> on ${peakDate}</span>
-          <span style="margin: 0 6px;">&bull;</span>
-          <span>Active Days: <strong style="color:#60a5fa;">${activeDaysCount} / ${data.length}</strong></span>
-        `;
-      }
-
-      const points = [];
-      const barWidth = Math.max(6, Math.min(20, (chartW / data.length) * 0.60));
-
-      const denom = data.length > 1 ? (data.length - 1) : 1;
-      data.forEach((d, i) => {
-        const val = values[i];
-        const x = data.length === 1 ? (padLeft + chartW / 2) : (padLeft + (i / denom) * chartW);
-        const y = baselineY - ((val / maxVal) * chartH);
-        points.push({ x, y, val, d });
-      });
-
-      const splinePath = getMonotoneSplinePath(points, baselineY, padTop);
-      const lastPt = points[points.length - 1];
-      const firstPt = points[0];
-      const areaPath = splinePath + ` L ${lastPt.x.toFixed(1)},${baselineY} L ${firstPt.x.toFixed(1)},${baselineY} Z`;
-
-      const strokeColor = timelineMetric === 'cost' ? '#10b981' : (timelineMetric === 'tokens' ? '#3b82f6' : '#8b5cf6');
-      const gradStop1 = timelineMetric === 'cost' ? 'rgba(16, 185, 129, 0.28)' : (timelineMetric === 'tokens' ? 'rgba(59, 130, 246, 0.28)' : 'rgba(139, 92, 246, 0.28)');
-      const barColor = timelineMetric === 'cost' ? 'rgba(16, 185, 129, 0.45)' : (timelineMetric === 'tokens' ? 'rgba(59, 130, 246, 0.45)' : 'rgba(139, 92, 246, 0.45)');
-
-      let gridHtml = '';
-      const gridTicks = [0, 0.25, 0.5, 0.75, 1.0];
-      gridTicks.forEach(tick => {
-        const y = baselineY - tick * chartH;
-        const tickVal = tick * maxVal;
-        const label = timelineMetric === 'cost' ? '$' + Math.round(tickVal) : (timelineMetric === 'tokens' ? formatNumber(tickVal) : Math.round(tickVal).toLocaleString());
-        gridHtml += `
-          <line x1="${padLeft}" y1="${y}" x2="${padLeft + chartW}" y2="${y}" stroke="#222329" stroke-dasharray="3 3" />
-          <text x="${padLeft - 10}" y="${y + 4}" fill="#71717a" font-size="10" text-anchor="end" font-family="var(--font-mono)">${label}</text>
-        `;
-      });
-
-      let barsHtml = '';
-      let hitboxesHtml = '';
-      let xLabelsHtml = '';
-      const labelStep = Math.max(2, Math.round(data.length / 7));
-      const labelIndices = new Set();
-      for (let i = 0; i < data.length; i += labelStep) {
-        labelIndices.add(i);
-      }
-      if (data.length > 0) {
-        const lastIdx = data.length - 1;
-        // Suppress ticks within 2 indices before the last index to guarantee zero overlap, but keep index 0
-        const minGap = Math.max(2, Math.floor(labelStep * 0.7));
-        for (let off = 1; off <= minGap; off++) {
-          if (lastIdx - off > 0) {
-            labelIndices.delete(lastIdx - off);
-          }
-        }
-        labelIndices.add(lastIdx);
-        labelIndices.add(0);
-      }
-
-      points.forEach((p, i) => {
-        const barH = baselineY - p.y;
-        if (p.val > 0) {
-          barsHtml += `
-            <rect id="bar-${i}" class="timeline-bar" x="${p.x - barWidth / 2}" y="${p.y}" width="${barWidth}" height="${barH}" rx="3" fill="${barColor}" style="transition: all 0.2s;" />
-          `;
-        }
-
-        hitboxesHtml += `
-          <rect class="hitbox" x="${p.x - (chartW / data.length) / 2}" y="${padTop}" width="${chartW / data.length}" height="${chartH + 10}" fill="transparent" style="cursor: crosshair;"
-            onmouseenter="onChartHover(event, ${i})" onmousemove="onChartHover(event, ${i})" onmouseleave="onChartLeave()" />
-        `;
-
-        if (labelIndices.has(i)) {
-          const dtStr = p.d.date ? p.d.date.slice(5) : '';
-          xLabelsHtml += `
-            <text x="${p.x}" y="${baselineY + 18}" fill="#71717a" font-size="10" text-anchor="middle" font-family="var(--font-mono)">${dtStr}</text>
-          `;
-        }
-      });
-
-      svg.innerHTML = `
-        <defs>
-          <linearGradient id="areaGradient" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="${gradStop1}" />
-            <stop offset="100%" stop-color="rgba(0,0,0,0)" />
-          </linearGradient>
-          <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-            <feGaussianBlur stdDeviation="2" result="blur" />
-            <feComposite in="SourceGraphic" in2="blur" operator="over" />
-          </filter>
-        </defs>
-        ${gridHtml}
-        ${barsHtml}
-        <path d="${areaPath}" fill="url(#areaGradient)" />
-        <path d="${splinePath}" fill="none" stroke="${strokeColor}" stroke-width="2.5" filter="url(#glow)" />
-        ${xLabelsHtml}
-        <g id="crosshair-group" style="display: none;">
-          <line id="crosshair-line" x1="0" y1="${padTop}" x2="0" y2="${baselineY}" stroke="#52525b" stroke-width="1.5" stroke-dasharray="2 2" />
-          <circle id="crosshair-dot" cx="0" cy="0" r="5" fill="${strokeColor}" stroke="#ffffff" stroke-width="2" />
-        </g>
-        ${hitboxesHtml}
-      `;
-    }
-
-    function onChartHover(e, idx) {
-      const data = getContinuousTimelineData(timelineRange);
-      const d = data[idx];
-      if (!d) return;
-
-      const container = document.getElementById('timeline-container');
-      const tooltip = document.getElementById('chart-tooltip');
-      const group = document.getElementById('crosshair-group');
-      const line = document.getElementById('crosshair-line');
-      const dot = document.getElementById('crosshair-dot');
-      const bar = document.getElementById('bar-' + idx);
-
-      const W = 1000, H = 220;
-      const padLeft = 65, padRight = 30, padTop = 30, padBottom = 35;
-      const chartW = W - padLeft - padRight;
-      const chartH = H - padTop - padBottom;
-      const baselineY = padTop + chartH;
-
-      const values = data.map(item => {
-        if (timelineMetric === 'cost') return item.cost_cached_usd || 0;
-        if (timelineMetric === 'tokens') return item.tokens || 0;
-        return item.invocations || 0;
-      });
-      const rawMax = Math.max(...values);
-      const minCeil = timelineMetric === 'cost' ? 1.0 : (timelineMetric === 'tokens' ? 100000 : 10);
-      const maxVal = Math.max(rawMax * 1.15, minCeil);
-
-      const val = values[idx];
-      const denom = data.length > 1 ? (data.length - 1) : 1;
-      const x = data.length === 1 ? (padLeft + chartW / 2) : (padLeft + (idx / denom) * chartW);
-      const y = baselineY - ((val / maxVal) * chartH);
-
-      if (group && line && dot) {
-        group.style.display = 'block';
-        line.setAttribute('x1', x);
-        line.setAttribute('x2', x);
-        dot.setAttribute('cx', x);
-        dot.setAttribute('cy', y);
-      }
-
-      if (bar) {
-        bar.style.opacity = '1';
-        bar.style.filter = 'drop-shadow(0 0 8px rgba(59, 130, 246, 0.6))';
-      }
-
-      tooltip.innerHTML = `
-        <div style="font-weight: 700; color: #f4f4f5; margin-bottom: 4px; font-size: 12px;">${d.date}</div>
-        <div style="display:flex; justify-content:space-between; gap:16px; margin-bottom:2px;">
-          <span style="color:#a1a1aa;">Commercial Cost:</span>
-          <span style="color:#34d399; font-weight:600; font-family:var(--font-mono);">$${(d.cost_cached_usd || 0).toFixed(2)} USD</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; gap:16px; margin-bottom:2px;">
-          <span style="color:#a1a1aa;">Token Volume:</span>
-          <span style="color:#60a5fa; font-family:var(--font-mono);">${formatNumber(d.tokens || 0)}</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; gap:16px; margin-bottom:2px;">
-          <span style="color:#a1a1aa;">AI Model Turns:</span>
-          <span style="color:#f4f4f5; font-family:var(--font-mono);">${d.invocations || 0}</span>
-        </div>
-        ${d.fresh_input_tokens ? `
-        <div style="margin-top:4px; padding-top:4px; border-top:1px solid rgba(255,255,255,0.08); font-size:10px; color:#71717a;">
-          Fresh Ingestion: ${formatNumber(d.fresh_input_tokens)} &bull; Cached: ${formatNumber(d.cached_context_tokens)}
-        </div>` : ''}
-      `;
-
-      const rect = container.getBoundingClientRect();
-      const pctX = x / W;
-      const tooltipX = pctX * rect.width;
-      const tooltipY = (y / H) * rect.height;
-
-      tooltip.style.left = tooltipX + 'px';
-      tooltip.style.top = Math.max(10, tooltipY - 20) + 'px';
-      tooltip.style.display = 'block';
-    }
-
-    function onChartLeave() {
-      const tooltip = document.getElementById('chart-tooltip');
-      const group = document.getElementById('crosshair-group');
-      if (tooltip) tooltip.style.display = 'none';
-      if (group) group.style.display = 'none';
-      document.querySelectorAll('.timeline-bar').forEach(b => {
-        b.style.opacity = '0.7';
-        b.style.filter = 'none';
-      });
-    }
-
-    renderTimeline();
-
-    // Segmented Ingestion Bar
-    function renderSegmentedBar() {
-      const s = DATA.summary || {};
-      const total = s.total_cumulative_tokens || 1;
-      const hitBadge = document.getElementById('hit-ratio-badge');
-      if (hitBadge) {
-        const hitRatio = (s.cache_hit_ratio_pct !== undefined && s.cache_hit_ratio_pct !== null) ? s.cache_hit_ratio_pct : 0;
-        hitBadge.innerText = hitRatio.toFixed(1) + '% Context Hit Ratio';
-      }
-      const pCache = ((s.cached_context_tokens || 0) / total) * 100;
-      const pFresh = ((s.fresh_input_tokens || 0) / total) * 100;
-      const pOut = ((s.output_tokens || 0) / total) * 100;
-      const pThk = ((s.thinking_tokens || 0) / total) * 100;
-      const pTools = ((s.tool_call_tokens || 0) / total) * 100;
-
-      document.getElementById('segmented-track').innerHTML = `
-        <div class="segment-fill seg-cache" style="width: ${pCache}%;"></div>
-        <div class="segment-fill seg-fresh" style="width: ${Math.max(0.5, pFresh)}%;"></div>
-        <div class="segment-fill seg-output" style="width: ${Math.max(0.5, pOut)}%;"></div>
-        <div class="segment-fill seg-thinking" style="width: ${Math.max(0.5, pThk)}%;"></div>
-        <div class="segment-fill seg-tools" style="width: ${Math.max(0.5, pTools)}%;"></div>
-      `;
-
-      const items = [
-        { label: 'Prompt Cache / Context', color: '#a855f7', val: s.cached_context_tokens, pct: pCache, desc: 'Reused context across agent steps' },
-        { label: 'Fresh Prompt Ingestion', color: '#3b82f6', val: s.fresh_input_tokens, pct: pFresh, desc: 'New user requests and file contents' },
-        { label: 'Model Completions', color: '#10b981', val: s.output_tokens, pct: pOut, desc: 'Code, analysis, and text outputs' },
-        { label: 'Extended Thinking', color: '#f43f5e', val: s.thinking_tokens, pct: pThk, desc: 'Inner chain-of-thought reasoning' },
-        { label: 'Tool Arguments', color: '#f59e0b', val: s.tool_call_tokens, pct: pTools, desc: 'Terminal command & search args' },
-      ];
-
-      document.getElementById('segmented-legend').innerHTML = items.map(i => `
-        <div class="legend-item">
-          <div class="legend-top">
-            <span class="legend-dot" style="background: ${i.color};"></span>
-            <span>${i.label}</span>
-          </div>
-          <div class="legend-val">${formatNumber(i.val)} <span style="font-size: 11px; color: var(--text-tertiary);">(${i.pct.toFixed(2)}%)</span></div>
-          <div class="legend-desc">${i.desc}</div>
-        </div>
-      `).join('');
-    }
-    renderSegmentedBar();
-
-    // Provider & Workspace Lists
-    function renderOverviewLists() {
-      const fams = DATA.families || {};
-      const pList = document.getElementById('provider-list');
-      pList.innerHTML = Object.entries(fams).map(([fam, d]) => `
-        <div class="dense-item">
-          <div class="dense-top">
-            <span class="dense-name" style="display:flex; align-items:center; gap:6px;">
-              <span class="legend-dot" style="background: ${fam === 'Google' ? '#3b82f6' : (fam === 'Anthropic' ? '#f59e0b' : '#10b981')};"></span>
-              ${fam === 'Google' ? 'Google Gemini' : (fam === 'Anthropic' ? 'Anthropic Claude' : (fam === 'OpenAI' ? 'OpenAI GPT' : escapeHtml(fam)))}
-            </span>
-            <span class="dense-val">${formatNumber(d.tokens)}</span>
-          </div>
-          <div style="font-size: 11px; color: var(--text-secondary); display:flex; justify-content:space-between;">
-            <span>Standard: $${(d.cost_uncached || 0).toFixed(2)}</span>
-            <span style="color:#34d399;">Cached: $${(d.cost_cached || 0).toFixed(2)}</span>
-          </div>
-        </div>
-      `).join('');
-
-      // Dynamic Provider Donut SVG
-      const donutContainer = document.getElementById('provider-donut-container');
-      if (donutContainer) {
-        const gTok = (fams.Google && fams.Google.tokens) || 0;
-        const aTok = (fams.Anthropic && fams.Anthropic.tokens) || 0;
-        const oTok = (fams.OpenAI && fams.OpenAI.tokens) || 0;
-        const totTok = gTok + aTok + oTok;
-        let gPct = 0, aPct = 0, oPct = 0;
-        let dominantName = 'Google';
-        let dominantPct = 0;
-        if (totTok > 0) {
-          gPct = (gTok / totTok) * 100;
-          aPct = (aTok / totTok) * 100;
-          oPct = (oTok / totTok) * 100;
-          const sortedFams = Object.entries(fams).sort((a,b) => (b[1].tokens || 0) - (a[1].tokens || 0));
-          if (sortedFams.length && sortedFams[0][1].tokens > 0) {
-            dominantName = sortedFams[0][0];
-            dominantPct = Math.round(((sortedFams[0][1].tokens || 0) / totTok) * 100);
-          }
-        }
-        const gDash = gPct.toFixed(1);
-        const aDash = aPct.toFixed(1);
-        const oDash = oPct.toFixed(1);
-        const aOffset = (-gPct).toFixed(1);
-        const oOffset = (-(gPct + aPct)).toFixed(1);
-        donutContainer.innerHTML = `
-          <div style="position: relative; width: 110px; height: 110px; flex-shrink: 0;">
-            <svg width="110" height="110" viewBox="0 0 36 36">
-              <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#2563eb" stroke-width="3.6" stroke-dasharray="${gDash}, 100" />
-              <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#f59e0b" stroke-width="3.6" stroke-dasharray="${aDash}, 100" stroke-dashoffset="${aOffset}" />
-              <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#10b981" stroke-width="3.6" stroke-dasharray="${oDash}, 100" stroke-dashoffset="${oOffset}" />
-            </svg>
-            <div style="position: absolute; top:0; left:0; width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center;">
-              <span style="font-size: 15px; font-weight: 700;">${totTok > 0 ? dominantPct + '%' : '0%'}</span>
-              <span style="font-size: 9px; color: var(--text-tertiary);">${totTok > 0 ? escapeHtml(dominantName) : 'None'}</span>
-            </div>
-          </div>
-        `;
-      }
-
-      const wList = document.getElementById('top-projects-list');
-      const sortedW = Object.entries(DATA.projects || {}).sort((a,b) => b[1].tokens - a[1].tokens).slice(0, 5);
-      const maxWTok = sortedW.length ? sortedW[0][1].tokens : 1;
-      wList.innerHTML = sortedW.map(([name, d]) => `
-        <div class="dense-item">
-          <div class="dense-top">
-            <span class="dense-name">${escapeHtml(name)} <span style="font-size:10px; color:var(--text-tertiary); font-weight:normal;">(${d.conversations || 0} chats)</span></span>
-            <span class="dense-val">${formatNumber(d.tokens)} &bull; $${(d.cost_uncached_usd || 0).toFixed(2)}</span>
-          </div>
-          <div class="dense-track">
-            <div class="dense-fill" style="width: ${(d.tokens / maxWTok) * 100}%;"></div>
-          </div>
-        </div>
-      `).join('');
-    }
-    renderOverviewLists();
-
-    // Render Models Table
-    function renderModelsTable() {
-      const tbody = document.getElementById('models-table-body');
-      tbody.innerHTML = Object.entries(DATA.models || {})
-        .sort((a,b) => b[1].total_tokens - a[1].total_tokens)
-        .map(([name, m]) => `
-          <tr>
-            <td style="font-weight: 600; color: var(--text-primary);">${escapeHtml(name)}</td>
-            <td><span class="badge-pill ${m.family === 'Google' ? 'badge-blue' : (m.family === 'Anthropic' ? 'badge-amber' : 'badge-green')}">${escapeHtml(m.family)}</span></td>
-            <td class="mono">${formatNumber(m.total_tokens)}</td>
-            <td class="mono">${(m.output_tokens || 0).toLocaleString()}</td>
-            <td class="mono">${(m.thinking_tokens || 0).toLocaleString()}</td>
-            <td class="mono">${(m.tool_call_tokens || 0).toLocaleString()}</td>
-            <td class="mono" style="color: #34d399; font-weight:600;">$${(m.cost_uncached_usd || 0).toFixed(2)}</td>
-            <td class="mono" style="color: #60a5fa;">$${(m.cost_cached_usd || 0).toFixed(2)}</td>
-          </tr>
-        `).join('');
-    }
-    renderModelsTable();
-
-    // Render Tools Table
-    function renderToolsTable() {
-      const tbody = document.getElementById('tools-table-body');
-      const tools = Object.entries(DATA.tools || {}).sort((a,b) => b[1].invocations - a[1].invocations);
-      const totalInvs = tools.reduce((acc, curr) => acc + curr[1].invocations, 0) || 1;
-      tbody.innerHTML = tools.map(([tName, d]) => `
-        <tr>
-          <td style="font-family: var(--font-mono); font-weight: 600; color: #93c5fd;">${escapeHtml(tName)}</td>
-          <td class="mono">${d.invocations.toLocaleString()}</td>
-          <td class="mono">${formatNumber(d.argument_tokens)}</td>
-          <td>
-            <div style="display:flex; align-items:center; gap:8px;">
-              <div style="flex:1; height:4px; background:#222329; border-radius:2px; overflow:hidden;">
-                <div style="height:100%; width:${((d.invocations/totalInvs)*100).toFixed(1)}%; background:#3b82f6;"></div>
-              </div>
-              <span class="mono">${((d.invocations/totalInvs)*100).toFixed(1)}%</span>
-            </div>
-          </td>
-        </tr>
-      `).join('');
-    }
-    renderToolsTable();
-
-    // Render Workspaces Table
-    function renderWorkspacesTable() {
-      const tbody = document.getElementById('projects-table-body');
-      tbody.innerHTML = Object.entries(DATA.projects || {})
-        .sort((a,b) => b[1].tokens - a[1].tokens)
-        .map(([pName, p]) => `
-          <tr>
-            <td style="font-weight: 600; color: var(--text-primary);">${escapeHtml(pName)}</td>
-            <td class="mono">${p.conversations}</td>
-            <td class="mono">${(p.invocations || 0).toLocaleString()}</td>
-            <td class="mono">${formatNumber(p.tokens)}</td>
-            <td class="mono" style="color: #34d399; font-weight:600;">$${(p.cost_uncached_usd || 0).toFixed(2)}</td>
-            <td class="mono" style="color: #60a5fa;">$${(p.cost_cached_usd || 0).toFixed(2)}</td>
-            <td style="font-size:11px; color:var(--text-tertiary);">${(p.models || []).slice(0, 2).map(escapeHtml).join(', ')}</td>
-          </tr>
-        `).join('');
-    }
-    renderWorkspacesTable();
-
-    // Render Conversation Ledger
-    function renderChats(chats) {
-      const tbody = document.getElementById('chats-table-body');
-      tbody.innerHTML = chats.map(c => `
-        <tr class="clickable-row" data-conv-id="${escapeHtml(c.id)}">
-          <td class="mono" style="color: var(--text-tertiary);">${escapeHtml(c.date || 'Unknown')}</td>
-          <td style="font-weight: 500; color: var(--text-primary);">${escapeHtml(c.project || 'General')}</td>
-          <td><span class="badge-pill ${c.primary_model && c.primary_model.includes('Claude') ? 'badge-amber' : (c.primary_model && c.primary_model.includes('OpenAI') ? 'badge-green' : 'badge-blue')}">${escapeHtml(c.primary_model || 'Unknown')}</span></td>
-          <td class="mono">${c.invocations || 0}</td>
-          <td class="mono">${formatNumber((c.fresh_input_tokens || 0) + (c.cached_context_tokens || 0))}</td>
-          <td class="mono">${(c.output_tokens || 0).toLocaleString()}</td>
-          <td class="mono">${(c.thinking_tokens || 0).toLocaleString()}</td>
-          <td class="mono" style="color: #34d399; font-weight: 600;">$${(c.cost_uncached_usd || 0).toFixed(2)}</td>
-          <td class="mono" style="color: #60a5fa;">$${(c.cost_cached_usd || 0).toFixed(2)}</td>
-          <td>
-            ${(c.anomalies || []).map(a => `<span class="badge-pill badge-rose" style="margin-right:4px;">${escapeHtml(a)}</span>`).join('') || '<span style="color:var(--text-tertiary); font-size:10px;">Normal</span>'}
-          </td>
-        </tr>
-      `).join('');
-
-      tbody.querySelectorAll('tr[data-conv-id]').forEach(row => {
-        row.addEventListener('click', () => {
-          const cid = row.getAttribute('data-conv-id');
-          if (cid) openDrawer(cid);
-        });
-      });
-    }
-    renderChats(DATA.conversations || []);
-
-    // Filter Logic
-    function filterChats() {
-      const qElem = document.getElementById('chat-search');
-      const q = (qElem && qElem.value ? qElem.value : '').toLowerCase();
-      const mElem = document.getElementById('chat-model-filter');
-      const m = mElem && mElem.value ? mElem.value : '';
-      const pElem = document.getElementById('chat-project-filter');
-      const p = pElem && pElem.value ? pElem.value : '';
-      const sElem = document.getElementById('chat-status-filter');
-      const s = sElem && sElem.value ? sElem.value : '';
-
-      const filtered = (DATA.conversations || []).filter(c => {
-        const matchQ = !q || (c.project && c.project.toLowerCase().includes(q)) || (c.id && c.id.toLowerCase().includes(q));
-        const matchM = !m || c.primary_model === m || (c.models && c.models.includes(m));
-        const matchP = !p || c.project === p;
-        const matchS = !s || (s === 'active' && c.is_active !== 0) || (s === 'archived' && c.is_active === 0);
-        return matchQ && matchM && matchP && matchS;
-      });
-      renderChats(filtered);
-    }
-
-    // Populate Filter Selects safely
-    function populateFilters() {
-      const mSel = document.getElementById('chat-model-filter');
-      const pSel = document.getElementById('chat-project-filter');
-      if (mSel) {
-        Object.keys(DATA.models || {}).forEach(m => {
-          const opt = document.createElement('option');
-          opt.value = m;
-          opt.textContent = m;
-          mSel.appendChild(opt);
-        });
-      }
-      if (pSel) {
-        Object.keys(DATA.projects || {}).forEach(p => {
-          const opt = document.createElement('option');
-          opt.value = p;
-          opt.textContent = p;
-          pSel.appendChild(opt);
-        });
-      }
-    }
-    populateFilters();
-
-    // Persistent Tab Switcher
-    function switchTab(tabId, el) {
-      currentTab = tabId;
-      try {
-        localStorage.setItem('antigravity_active_tab', tabId);
-        if (vscode) {
-          const s = vscode.getState() || {};
-          vscode.setState({ ...s, activeTab: tabId });
-        }
-      } catch(e) {}
-
-      document.querySelectorAll('.tab-btn').forEach(b => {
-        b.classList.toggle('active', b.getAttribute('data-tab') === tabId);
-      });
-      document.querySelectorAll('.tab-pane').forEach(p => {
-        p.classList.toggle('active', p.id === 'tab-' + tabId);
-      });
-    }
-
-    // Slide-Over Detail Drawer
-    function openDrawer(convId) {
-      activeDrawerConvId = convId;
-      const conv = (DATA.conversations || []).find(c => c.id === convId);
-      if (!conv) return;
-
-      document.getElementById('drawer-title').innerText = `${conv.project || 'General'} (${conv.date || 'Unknown'})`;
-      document.getElementById('drawer-subtitle').innerText = `${conv.id} • ${conv.primary_model}`;
-
-      // Render Context Compounding Curve
-      const curveSvg = document.getElementById('drawer-curve-svg');
-      const trace = conv.trace || [];
-      if (trace.length > 1) {
-        const maxCtx = Math.max(...trace.map(t => t.context), 1000);
-        const pts = trace.map((t, i) => {
-          const x = (i / (trace.length - 1)) * 480 + 10;
-          const y = 110 - ((t.context / maxCtx) * 95);
-          return `${x},${y}`;
-        }).join(' ');
-
-        const areaPts = `10,115 ${pts} 490,115`;
-        curveSvg.innerHTML = `
-          <defs>
-            <linearGradient id="curveGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.35" />
-              <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.0" />
-            </linearGradient>
-          </defs>
-          <polygon points="${areaPts}" fill="url(#curveGrad)" />
-          <polyline points="${pts}" fill="none" stroke="#3b82f6" stroke-width="2.5" />
-        `;
-      } else {
-        curveSvg.innerHTML = `<text x="250" y="65" fill="#71717a" text-anchor="middle" font-size="12">Single-turn session (no compounding)</text>`;
-      }
-
-      // Render Token Anatomy
-      document.getElementById('drawer-tokens-grid').innerHTML = `
-        <div class="legend-item"><div class="legend-top">Fresh Input</div><div class="legend-val">${formatNumber(conv.fresh_input_tokens || 0)}</div></div>
-        <div class="legend-item"><div class="legend-top">Cached Context</div><div class="legend-val">${formatNumber(conv.cached_context_tokens || 0)}</div></div>
-        <div class="legend-item"><div class="legend-top">Generated Output</div><div class="legend-val">${(conv.output_tokens || 0).toLocaleString()}</div></div>
-        <div class="legend-item"><div class="legend-top">Reasoning / Thinking</div><div class="legend-val">${(conv.thinking_tokens || 0).toLocaleString()}</div></div>
-      `;
-
-      // Render Tool Pills
-      const toolEntries = Object.entries(conv.tools || {});
-      document.getElementById('drawer-tools-pills').innerHTML = toolEntries.length
-        ? toolEntries.map(([t, count]) => `<div class="tool-pill">${escapeHtml(t)} <span>${count}x</span></div>`).join('')
-        : '<span style="color:var(--text-tertiary); font-size:11px;">No tool executions in this conversation</span>';
-
-      // Render Stepper Table
-      const sBody = document.getElementById('drawer-steps-body');
-      sBody.innerHTML = trace.map(t => `
-        <tr>
-          <td class="mono">#${t.turn}</td>
-          <td class="mono">${formatNumber(t.context)}</td>
-          <td class="mono">${t.out}</td>
-          <td style="font-size:10px; color:#93c5fd;">${(t.tools || []).map(escapeHtml).join(', ') || '-'}</td>
-          <td class="mono" style="color:#34d399;">$${(t.cost || 0).toFixed(3)}</td>
-        </tr>
-      `).join('');
-
-      document.getElementById('drawer-overlay').classList.add('open');
-      document.getElementById('trace-drawer').classList.add('open');
-    }
-
-    function closeDrawer() {
-      activeDrawerConvId = null;
-      document.getElementById('drawer-overlay').classList.remove('open');
-      document.getElementById('trace-drawer').classList.remove('open');
-    }
-
-    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
-
-
-
-    // CSV Export
-    function exportLedgerCsv() {
-      if (vscode) {
-        vscode.postMessage({ command: 'exportCsv' });
-        return;
-      }
-      const convs = DATA.conversations || [];
-      const headers = ['Date', 'Conversation_ID', 'Project', 'Model', 'Turns', 'Fresh_Input', 'Cached_Context', 'Output', 'Thinking', 'Total_Tokens', 'Standard_Cost_USD', 'Cached_Cost_USD'];
-      let csv = headers.join(',') + '\n';
-      convs.forEach(c => {
-        csv += [
-          c.date, c.id, `"${c.project}"`, `"${c.primary_model}"`,
-          c.invocations, c.fresh_input_tokens, c.cached_context_tokens,
-          c.output_tokens, c.thinking_tokens, c.total_tokens,
-          c.cost_uncached_usd, c.cost_cached_usd
-        ].join(',') + '\n';
-      });
-
-      const blob = new Blob([csv], { type: 'text/csv' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `antigravity_token_ledger_${new Date().toISOString().slice(0,10)}.csv`;
-      a.click();
-    }
-
-    // Markdown Copy
-    function copyMarkdownSummary() {
-      const s = DATA.summary;
-      const b = DATA.budget || {};
-      const md = `### 🚀 Antigravity IDE — Token & Cost Summary Report
-- **Total Processed Volume**: ${formatNumber(s.total_cumulative_tokens)} (${(s.cache_hit_ratio_pct || 99.9)}% Prompt Cache Hit)
-- **Standard Commercial Valuation**: $${s.cost_uncached_usd.toFixed(2)} USD
-- **Prompt-Cached Real Cost**: $${s.cost_cached_usd.toFixed(2)} USD (*Saved $${s.cache_savings_usd.toFixed(2)}*)
-- **Total Autonomous Turns**: ${s.total_invocations.toLocaleString()} across ${s.total_conversations} sessions
-- **Today's Spend & Pacing**: $${(b.today_cost_cached || 0).toFixed(2)} / $${b.daily_target_usd || 5}.00 (${b.today_percent_used || 0}% cap)
-*Generated by Quota*`;
-
-      navigator.clipboard.writeText(md);
-      alert('Markdown report copied to clipboard!');
-    }
-
-    function handleRefresh() {
-      const btn = document.getElementById('refresh-btn');
-      const icon = document.getElementById('refresh-icon');
-      const label = document.getElementById('refresh-label');
-      if (btn) {
-        btn.disabled = true;
-        if (icon) icon.classList.add('spinning');
-        if (label) label.innerText = 'Scanning...';
-      }
-      if (vscode) {
-        vscode.postMessage({ command: 'refresh' });
-      } else {
-        window.location.reload();
-      }
-    }
-
-
-    function updateUI() {
-      initMetrics();
-      renderTimeline();
-      renderSegmentedBar();
-      renderOverviewLists();
-      renderModelsTable();
-      renderToolsTable();
-      renderWorkspacesTable();
-      filterChats();
-      if (activeDrawerConvId) {
-        openDrawer(activeDrawerConvId);
-      }
-    }
-
-    // Restore saved tab
-    (function restoreActiveTab() {
-      let savedTab = 'overview';
-      try {
-        if (vscode && vscode.getState() && vscode.getState().activeTab) {
-          savedTab = vscode.getState().activeTab;
-        } else if (localStorage.getItem('antigravity_active_tab')) {
-          savedTab = localStorage.getItem('antigravity_active_tab');
-        }
-      } catch(e) {}
-
-      if (savedTab) {
-        const targetBtn = document.querySelector(".tab-btn[data-tab='" + savedTab + "']");
-        if (targetBtn) {
-          switchTab(savedTab, targetBtn);
-        }
-      }
-    })();
-
-    window.addEventListener('message', event => {
-      const message = event.data;
-      if (message.command === 'updateData' && message.data) {
-        DATA = message.data;
-        updateUI();
-        const btn = document.getElementById('refresh-btn');
-        const icon = document.getElementById('refresh-icon');
-        const label = document.getElementById('refresh-label');
-        if (btn) {
-          btn.disabled = false;
-          if (icon) icon.classList.remove('spinning');
-          if (label) label.innerText = 'Refresh Data';
-        }
-      }
-    });
-  </script>
-  <!-- Modal for Budget Guardrails -->
-  <div id="budget-modal" class="modal-overlay">
-    <div class="modal-card">
-      <h3>Configure Budget Guardrails</h3>
-      <div class="form-group">
-        <label>Daily Budget Cap (USD)</label>
-        <input type="number" step="0.50" min="0.10" id="budget-input-daily" value="5.00" />
-      </div>
-      <div class="form-group">
-        <label>Monthly Budget Cap (USD)</label>
-        <input type="number" step="1.00" min="1.00" id="budget-input-monthly" value="50.00" />
-      </div>
-      <div class="modal-actions">
-        <button class="btn" onclick="closeBudgetModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="saveBudgetFromModal()">Save Guardrails</button>
-      </div>
-    </div>
-  </div>
-</body>
-</html>
-'''
+def get_dashboard_template() -> str:
+    """Load the canonical dashboard HTML template from disk."""
+    candidates = [
+        os.path.join(BASE_DIR, "extension", "dashboard.html"),
+        os.path.join(BASE_DIR, "dashboard.html"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension", "dashboard.html"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return f.read()
+    raise FileNotFoundError("Canonical dashboard template (dashboard.html) not found.")
+
+class _TemplateProxy:
+    """Proxy object preserving backward compatibility for ENTERPRISE_HTML_TEMPLATE access."""
+    def __str__(self):
+        return get_dashboard_template()
+    def __repr__(self):
+        return repr(get_dashboard_template())
+    def splitlines(self, *args, **kwargs):
+        return get_dashboard_template().splitlines(*args, **kwargs)
+    def replace(self, *args, **kwargs):
+        return get_dashboard_template().replace(*args, **kwargs)
+    def __contains__(self, item):
+        return item in get_dashboard_template()
+
+ENTERPRISE_HTML_TEMPLATE = _TemplateProxy()
 
 def get_logo_base64():
     candidates = [
         os.path.join(BASE_DIR, "icon.png"),
         os.path.join(BASE_DIR, "logo_256.png"),
         os.path.join(BASE_DIR, "logo.png"),
+        os.path.join(BASE_DIR, "extension", "icon.png"),
+        os.path.join(BASE_DIR, "extension", "logo_256.png"),
+        os.path.join(BASE_DIR, "extension", "logo.png"),
     ]
     for p in candidates:
         if os.path.exists(p):
@@ -3120,10 +1509,13 @@ def generate_dashboard_html(data, out_dir=None):
         out_dir = DATA_DIR
     os.makedirs(out_dir, exist_ok=True)
     html_path = os.path.join(out_dir, "dashboard.html")
-    data_json = json.dumps(data).replace('</', '<\\/')
+    template = get_dashboard_template()
+    nonce = secrets.token_urlsafe(24)
+    data_json = json.dumps(data).replace('</', '<\/')
     logo_b64 = get_logo_base64()
-    html_content = ENTERPRISE_HTML_TEMPLATE.replace("__DATA_PLACEHOLDER__", data_json)
+    html_content = template.replace("__DATA_PLACEHOLDER__", data_json)
     html_content = html_content.replace("__LOGO_PLACEHOLDER__", logo_b64)
+    html_content = html_content.replace("__NONCE__", nonce)
     tmp_path = html_path + f".tmp.{os.getpid()}"
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(html_content)

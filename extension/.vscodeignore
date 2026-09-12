@@ -16,7 +16,6 @@ persistent_ledger.json
 persistent_ledger.sqlite*
 token_data.json
 budget_config.json
-dashboard.html
 dashboard.html.tmp.*
 backups/**
 *.sqlite*
