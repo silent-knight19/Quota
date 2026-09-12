@@ -1239,7 +1239,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
     /* KPI Metrics Hero Strip */
     .metric-grid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
       gap: 16px;
       margin-bottom: 24px;
     }
@@ -1250,21 +1250,41 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       padding: 18px 20px;
       position: relative;
       transition: border-color 0.15s;
+      min-width: 0;
     }
     .metric-card:hover { border-color: var(--border-hover); }
-    .metric-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-    .metric-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-tertiary); }
-    .metric-value { font-size: 28px; font-weight: 700; letter-spacing: -0.03em; color: var(--text-primary); font-variant-numeric: tabular-nums; }
-    .metric-sub { font-size: 11px; color: var(--text-secondary); margin-top: 6px; display: flex; align-items: center; gap: 6px; }
+    .metric-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      gap: 8px;
+    }
+    .metric-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-tertiary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex: 1;
+    }
+    .metric-value { font-size: 28px; font-weight: 700; letter-spacing: -0.03em; color: var(--text-primary); font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .metric-sub { font-size: 11px; color: var(--text-secondary); margin-top: 6px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 
     .badge-pill {
       font-size: 10px;
       font-weight: 600;
-      padding: 2px 7px;
+      padding: 3px 8px;
       border-radius: 9999px;
       display: inline-flex;
       align-items: center;
       gap: 4px;
+      white-space: nowrap;
+      flex-shrink: 0;
+      line-height: 1.3;
     }
     .badge-green { background: var(--accent-emerald-subtle); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.2); }
     .badge-blue { background: var(--accent-blue-subtle); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.2); }
@@ -1451,7 +1471,9 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 10px;
-      overflow: hidden;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
     }
     .table-controls {
       display: flex;
@@ -1483,25 +1505,33 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       outline: none;
     }
 
-    table { width: 100%; border-collapse: collapse; text-align: left; }
+    table {
+      width: 100%;
+      min-width: 940px;
+      border-collapse: collapse;
+      text-align: left;
+    }
     th {
       font-size: 11px;
       font-weight: 600;
       color: var(--text-tertiary);
       text-transform: uppercase;
       letter-spacing: 0.04em;
-      padding: 10px 16px;
+      padding: 11px 16px;
       border-bottom: 1px solid var(--border);
-      background: rgba(0,0,0,0.15);
+      background: rgba(0,0,0,0.25);
+      white-space: nowrap;
     }
     td {
       font-size: 12px;
-      padding: 10px 16px;
+      padding: 11px 16px;
       border-bottom: 1px solid var(--border-subtle);
       color: var(--text-secondary);
+      white-space: nowrap;
+      vertical-align: middle;
     }
     tr.clickable-row { cursor: pointer; transition: background 0.15s; }
-    tr.clickable-row:hover { background: rgba(255,255,255,0.03); }
+    tr.clickable-row:hover { background: rgba(255,255,255,0.04); }
     .mono { font-family: var(--font-mono); font-size: 11px; }
 
     /* Slide-Over Detail Drawer */
@@ -2138,6 +2168,70 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       return result;
     }
 
+    // Monotone Cubic Spline (Fritsch-Carlson) - Mathematically prevents negative overshoots
+    function getMonotoneSplinePath(points, baselineY) {
+      const n = points.length;
+      if (n === 0) return '';
+      if (n === 1) return `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
+      if (n === 2) {
+        return `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)} L ${points[1].x.toFixed(1)},${points[1].y.toFixed(1)}`;
+      }
+
+      const dx = new Array(n - 1);
+      const dy = new Array(n - 1);
+      const slopes = new Array(n - 1);
+      for (let i = 0; i < n - 1; i++) {
+        dx[i] = points[i + 1].x - points[i].x;
+        dy[i] = points[i + 1].y - points[i].y;
+        slopes[i] = dx[i] !== 0 ? dy[i] / dx[i] : 0;
+      }
+
+      const tangents = new Array(n);
+      tangents[0] = slopes[0];
+      for (let i = 1; i < n - 1; i++) {
+        if (slopes[i - 1] * slopes[i] <= 0) {
+          tangents[i] = 0;
+        } else {
+          tangents[i] = (slopes[i - 1] + slopes[i]) / 2;
+        }
+      }
+      tangents[n - 1] = slopes[n - 2];
+
+      for (let i = 0; i < n - 1; i++) {
+        if (dy[i] === 0) {
+          tangents[i] = 0;
+          tangents[i + 1] = 0;
+        } else {
+          const a = tangents[i] / slopes[i];
+          const b = tangents[i + 1] / slopes[i];
+          if (a < 0) tangents[i] = 0;
+          if (b < 0) tangents[i + 1] = 0;
+          const h = a * a + b * b;
+          if (h > 9) {
+            const tau = 3 / Math.sqrt(h);
+            tangents[i] = tau * a * slopes[i];
+            tangents[i + 1] = tau * b * slopes[i];
+          }
+        }
+      }
+
+      let path = `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
+      for (let i = 0; i < n - 1; i++) {
+        const segDx = dx[i] / 3;
+        let cp1x = points[i].x + segDx;
+        let cp1y = points[i].y + tangents[i] * segDx;
+        let cp2x = points[i + 1].x - segDx;
+        let cp2y = points[i + 1].y - tangents[i + 1] * segDx;
+
+        // Guaranteed baseline clamping: strictly non-negative
+        cp1y = Math.min(baselineY, cp1y);
+        cp2y = Math.min(baselineY, cp2y);
+
+        path += ` C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${points[i + 1].x.toFixed(1)},${points[i + 1].y.toFixed(1)}`;
+      }
+      return path;
+    }
+
     function renderTimeline() {
       const svg = document.getElementById('timeline-svg');
       const statsEl = document.getElementById('timeline-summary-stats');
@@ -2159,7 +2253,9 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
         return d.invocations || 0;
       });
 
-      const maxVal = Math.max(...values, timelineMetric === 'cost' ? 1.0 : (timelineMetric === 'tokens' ? 100000 : 10));
+      const rawMax = Math.max(...values);
+      const minCeil = timelineMetric === 'cost' ? 1.0 : (timelineMetric === 'tokens' ? 100000 : 10);
+      const maxVal = Math.max(rawMax * 1.15, minCeil);
       const totalPeriod = values.reduce((a, b) => a + b, 0);
       const avgPeriod = totalPeriod / data.length;
       const peakIdx = values.indexOf(Math.max(...values));
@@ -2182,7 +2278,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       }
 
       const points = [];
-      const barWidth = Math.max(8, Math.min(22, (chartW / data.length) * 0.65));
+      const barWidth = Math.max(6, Math.min(20, (chartW / data.length) * 0.60));
 
       const denom = data.length > 1 ? (data.length - 1) : 1;
       data.forEach((d, i) => {
@@ -2192,25 +2288,10 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
         points.push({ x, y, val, d });
       });
 
-      let splinePath = '';
-      if (points.length === 1) {
-        splinePath = `M ${points[0].x},${points[0].y}`;
-      } else {
-        splinePath = `M ${points[0].x},${points[0].y}`;
-        for (let i = 0; i < points.length - 1; i++) {
-          const p0 = i > 0 ? points[i - 1] : points[i];
-          const p1 = points[i];
-          const p2 = points[i + 1];
-          const p3 = i < points.length - 2 ? points[i + 2] : p2;
-          const cp1x = p1.x + (p2.x - p0.x) / 6;
-          const cp1y = p1.y + (p2.y - p0.y) / 6;
-          const cp2x = p2.x - (p3.x - p1.x) / 6;
-          const cp2y = p2.y - (p3.y - p1.y) / 6;
-          splinePath += ` C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
-        }
-      }
-
-      const areaPath = splinePath + ` L ${points[points.length - 1].x},${baselineY} L ${points[0].x},${baselineY} Z`;
+      const splinePath = getMonotoneSplinePath(points, baselineY);
+      const lastPt = points[points.length - 1];
+      const firstPt = points[0];
+      const areaPath = splinePath + ` L ${lastPt.x.toFixed(1)},${baselineY} L ${firstPt.x.toFixed(1)},${baselineY} Z`;
 
       const strokeColor = timelineMetric === 'cost' ? '#10b981' : (timelineMetric === 'tokens' ? '#3b82f6' : '#8b5cf6');
       const gradStop1 = timelineMetric === 'cost' ? 'rgba(16, 185, 129, 0.28)' : (timelineMetric === 'tokens' ? 'rgba(59, 130, 246, 0.28)' : 'rgba(139, 92, 246, 0.28)');
@@ -2231,7 +2312,20 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
       let barsHtml = '';
       let hitboxesHtml = '';
       let xLabelsHtml = '';
-      const labelInterval = Math.max(1, Math.ceil(data.length / 8));
+      const labelStep = Math.max(2, Math.round(data.length / 7));
+      const labelIndices = new Set();
+      for (let i = 0; i < data.length; i += labelStep) {
+        labelIndices.add(i);
+      }
+      if (data.length > 0) {
+        const lastIdx = data.length - 1;
+        // Suppress ticks within 2 indices before the last index to guarantee zero overlap
+        const minGap = Math.max(2, Math.floor(labelStep * 0.7));
+        for (let off = 1; off <= minGap; off++) {
+          labelIndices.delete(lastIdx - off);
+        }
+        labelIndices.add(lastIdx);
+      }
 
       points.forEach((p, i) => {
         const barH = baselineY - p.y;
@@ -2246,7 +2340,7 @@ ENTERPRISE_HTML_TEMPLATE = r'''<!DOCTYPE html>
             onmouseenter="onChartHover(event, ${i})" onmousemove="onChartHover(event, ${i})" onmouseleave="onChartLeave()" />
         `;
 
-        if (i % labelInterval === 0 || i === data.length - 1) {
+        if (labelIndices.has(i)) {
           const dtStr = p.d.date ? p.d.date.slice(5) : '';
           xLabelsHtml += `
             <text x="${p.x}" y="${baselineY + 18}" fill="#71717a" font-size="10" text-anchor="middle" font-family="var(--font-mono)">${dtStr}</text>
